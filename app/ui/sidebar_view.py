@@ -1,81 +1,164 @@
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+from typing import Callable, Optional
 
 import butterflyui as ui
 
 
 class SidebarView:
-    """A simple sidebar implemented with ButterflyUI components only.
+	"""Conversation sidebar — polished card-based list with reliable event binding."""
 
-    Usage:
-        view = SidebarView(conversations=[{"id": "1", "title": "Chat A"}])
-        container = view.build()
-        view.on_select(lambda id: print('selected', id))
-        view.on_new(lambda: print('new convo'))
-    """
+	_BG        = "#F3F4F6"
+	_SURFACE   = "#FFFFFF"
+	_BORDER    = "#C5C5C5"
+	_TEXT      = "#1A1A2E"
+	_MUTED     = "#6B7280"
+	_ACCENT    = "#6366F1"
+	_ACTIVE_BG = "#EEF2FF"
 
-    def __init__(self, conversations: Optional[List[dict]] = None, width: int = 300) -> None:
-        self.conversations = conversations or []
-        self._on_select: Optional[Callable[[str], None]] = None
-        self._on_new: Optional[Callable[[], None]] = None
-        self.width = width
-        self._container = self._build_container()
+	def __init__(self, width: int = 280) -> None:
+		self.width = width
+		self._on_new: Optional[Callable[[], None]] = None
+		self._on_select: Optional[Callable[[str], None]] = None
+		self._on_refresh: Optional[Callable[[], None]] = None
 
-    def _build_container(self) -> ui.Container:
-        header = ui.Container(
-            ui.Row(
-                ui.Text("Conversations", style={"font_size": 16}),
-                ui.Spacer(),
-                ui.Button(text="+", width=36, on_click=self._handle_new),
-            ),
-            padding=8,
-        )
+		self.title = ui.Text(
+			"Conversations",
+			style={"font_size": "16", "font_weight": "700", "color": "self._TEXT"},
+		)
+		self.subtitle = ui.Text(
+			"Genesis memory",
+			style={"font_size": "11", "color": "self._MUTED"},
+		)
 
-        self._list_col = ui.Column(spacing=6)
-        for conv in self.conversations:
-            self._list_col.children.append(self._conv_item(conv))
+		self.new_button = ui.Button(
+			text="＋  New Chat", variant="filled", events=["click"],
+			style={"border_radius": "10", "background": "self._ACCENT", "color": "self._TEXT", "font_weight": "600", "font_size": "13"},
+		)
+		self.refresh_button = ui.GlyphButton(
+			glyph="refresh", tooltip="Refresh conversations", events=["click"],
+			color="self._MUTED", size="20",
+		)
 
-        body = ui.Expanded(child=ui.Container(self._list_col, padding=6))
+		self.list_column = ui.Column(spacing="4")
+		self.empty_state = ui.Text(
+			"No conversations yet",
+			style={"font_size": "12", "color": "self._MUTED"},
+		)
 
-        return ui.Container(ui.Column(header, body, spacing=8), width=self.width)
+		self._sessions: list[dict] = []
+		self._active_id: str | None = None
 
-    def _conv_item(self, conv: dict) -> ui.Container:
-        title = conv.get("title") or conv.get("name") or "Untitled"
-        conv_id = conv.get("id") or title
+	# ── Public callbacks ────────────────────────────────────────────
 
-        def _on_click(event=None, _id=conv_id):
-            self._select(_id)
+	def on_new(self, callback: Callable[[], None]) -> None:
+		self._on_new = callback
 
-        btn = ui.Button(text=title, variant="text", on_click=_on_click, width="100%")
-        return ui.Container(btn, padding=4)
+	def on_select(self, callback: Callable[[str], None]) -> None:
+		self._on_select = callback
 
-    def _select(self, conv_id: str) -> None:
-        if callable(self._on_select):
-            try:
-                self._on_select(conv_id)
-            except Exception:
-                pass
+	def on_refresh(self, callback: Callable[[], None]) -> None:
+		self._on_refresh = callback
 
-    def _handle_new(self, event=None) -> None:
-        if callable(self._on_new):
-            try:
-                self._on_new()
-            except Exception:
-                pass
+	def bind_events(self, session) -> None:
+		"""Explicitly bind button click events to the live session."""
+		self.new_button.on_click(session, self._handle_new)
+		self.refresh_button.on_click(session, self._handle_refresh)
 
-    def on_select(self, callback: Callable[[str], None]) -> None:
-        self._on_select = callback
+	# ── Internal handlers ───────────────────────────────────────────
 
-    def on_new(self, callback: Callable[[], None]) -> None:
-        self._on_new = callback
+	def _handle_new(self, event=None) -> None:
+		if callable(self._on_new):
+			self._on_new()
 
-    def set_conversations(self, conversations: List[dict]) -> None:
-        self.conversations = conversations
-        # rebuild list
-        self._list_col.children.clear()
-        for conv in self.conversations:
-            self._list_col.children.append(self._conv_item(conv))
+	def _handle_refresh(self, event=None) -> None:
+		if callable(self._on_refresh):
+			self._on_refresh()
 
-    def build(self) -> ui.Container:
-        return self._container
+	# ── Session list management ─────────────────────────────────────
+
+	def set_sessions(self, sessions: list[dict], active_id: str | None = None) -> None:
+		self._sessions = sessions
+		self._active_id = active_id
+		self._rebuild_list()
+
+	def set_active(self, session_id: str | None) -> None:
+		self._active_id = session_id
+		self._rebuild_list()
+
+	def _rebuild_list(self) -> None:
+		self.list_column.children.clear()
+
+		if not self._sessions:
+			self.list_column.children.append(
+				ui.Container(self.empty_state, padding=12),
+			)
+			return
+
+		for session in self._sessions:
+			sid = str(session.get("id", "")).strip()
+			if not sid:
+				continue
+			title = str(session.get("title", "Untitled")).strip() or "Untitled"
+			is_active = sid == self._active_id
+
+			card = ui.Surface(
+				ui.Row(
+					ui.Text("💬", style={"font_size": 14}),
+					ui.Text(
+						title,
+						style={
+							"font_size": "13",
+							"font_weight": 600 if is_active else 400,
+							"color": "self._ACCENT" if is_active else "self._TEXT",
+						},
+					),
+					spacing=8,
+				),
+				padding="10",
+				radius="10",
+				bgcolor="self._ACTIVE_BG" if is_active else "self._SURFACE",
+				border_color="self._ACCENT" if is_active else "self._BORDER",
+				border_width=1,
+			)
+			# Wrap in a Pressable so the whole card is tappable
+			pressable = ui.Pressable(
+				card,
+				events=["click"],
+				on_click=lambda e=None, selected=sid: self._select(selected),
+				style={"cursor": "pointer"},
+			)
+			self.list_column.children.append(ui.Container(pressable, padding={"left": 2, "right": 2}))
+
+	def _select(self, session_id: str) -> None:
+		if callable(self._on_select):
+			self._on_select(session_id)
+
+	# ── Layout ──────────────────────────────────────────────────────
+
+	def build(self) -> ui.Container:
+		header = ui.Container(
+			ui.Column(self.title, self.subtitle, spacing=2),
+			padding={"left": 16, "right": 16, "top": 16, "bottom": 8},
+		)
+
+		actions = ui.Container(
+			ui.Row(self.new_button, ui.Spacer(), self.refresh_button, spacing=8),
+			padding={"left": 12, "right": 12, "top": 4, "bottom": 8},
+		)
+
+		body = ui.Expanded(
+			child=ui.ScrollableColumn(
+				self.list_column,
+				padding={"left": 8, "right": 8},
+			),
+		)
+
+		divider = ui.Divider(color=self._BORDER)
+
+		return ui.Container(
+			ui.Column(header, actions, divider, body, spacing=0, expand=True),
+			width=self.width,
+			bgcolor="self._BG",
+			style={"border_right": f"1px solid {self._BORDER}"},
+		)

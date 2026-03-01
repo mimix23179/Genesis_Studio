@@ -1,437 +1,574 @@
-"""Genesis Studio Shell — the main application window.
-
-Launches the Genesis Runtime in a background thread, connects via WebSocket,
-and wires the ButterflyUI components to the live message bus.
-"""
-
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
+from itertools import count
 from pathlib import Path
 from typing import Any
 
 import butterflyui as ui
 
-from app.utils import read_text_file, render_template, json_for_script_tag
-from app.ui.sidebar_view import SidebarView
-from app.ui.chat_page import ChatPage
-from app.ui.terminal_container import TerminalContainer
+from app.config import AppPaths, RuntimeSettings, resolve_paths
+from genesis.core.ws_server import GenesisRuntime
+from .chat_page import ChatPage
+from .sidebar_view import SidebarView
+from .terminal_container import TerminalContainer
 
 
-# ── Runtime Bridge ───────────────────────────────────────────────────
+logger = logging.getLogger("genesis.shell")
+
+
+# ━━━━━━━━━━━━━━━━━━━  Runtime Bridge  ━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class RuntimeBridge:
-    """Manages the Genesis Runtime process and WebSocket connection.
+	"""Hosts / attaches to a Genesis runtime instance over WebSocket."""
 
-    Runs the runtime in a background thread and provides an async bridge
-    for the ButterflyUI app to send/receive JSON-RPC messages.
-    """
+	def __init__(self, on_message, settings: RuntimeSettings) -> None:
+		self._on_message = on_message
+		self._settings   = settings
+		self._loop: asyncio.AbstractEventLoop | None = None
+		self._ws   = None
+		self._server = None
+		self._runtime_port: int | None = None
+		self._thread: threading.Thread | None = None
+		self._connected = threading.Event()
 
-    def __init__(self, on_message=None) -> None:
-        self._ws = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._thread: threading.Thread | None = None
-        self._on_message = on_message
-        self._connected = threading.Event()
-        self._runtime = None
+	def start(self) -> None:
+		self._thread = threading.Thread(target=self._run, daemon=True)
+		self._thread.start()
 
-    def start(self) -> None:
-        """Launch runtime + client in a background thread."""
-        self._thread = threading.Thread(target=self._run_thread, daemon=True)
-        self._thread.start()
+	def _run(self) -> None:
+		self._loop = asyncio.new_event_loop()
+		asyncio.set_event_loop(self._loop)
+		try:
+			self._loop.run_until_complete(self._bootstrap())
+		except Exception as exc:
+			logger.exception("Runtime bridge crashed: %s", exc)
 
-    def _run_thread(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._start_runtime_and_connect())
+	async def _bootstrap(self) -> None:
+		import websockets
 
-    async def _start_runtime_and_connect(self) -> None:
-        # Import here to avoid circular imports
-        from genesis.core.ws_server import GenesisRuntime
+		ports = [
+			self._settings.preferred_port + offset
+			for offset in range(self._settings.max_port_scan)
+		]
 
-        # Start the runtime server
-        self._runtime = GenesisRuntime(db_path="data/genesis.sqlite")
-        import websockets
-        server = await websockets.serve(
-            self._runtime._ws_handler, "127.0.0.1", 8765
-        )
+		# Try connecting to an existing runtime first
+		for port in ports:
+			url = f"ws://{self._settings.host}:{port}"
+			try:
+				self._ws = await websockets.connect(url)
+				self._runtime_port = port
+				self._connected.set()
+				await self._recv_loop()
+				return
+			except Exception:
+				continue
 
-        # Connect as a client
-        self._ws = await websockets.connect("ws://127.0.0.1:8765")
-        self._connected.set()
+		# No runtime found — start one ourselves
+		for port in ports:
+			try:
+				runtime = GenesisRuntime(
+					db_path=self._settings.db_path,
+					host=self._settings.host,
+					port=port,
+				)
+				self._server = await websockets.serve(
+					runtime._ws_handler, self._settings.host, port,
+				)
+				self._ws = await websockets.connect(
+					f"ws://{self._settings.host}:{port}"
+				)
+				self._runtime_port = port
+				self._connected.set()
+				await self._recv_loop()
+				return
+			except OSError:
+				continue
 
-        # Listen for messages from the runtime
-        try:
-            async for raw in self._ws:
-                msg = json.loads(raw)
-                if self._on_message:
-                    self._on_message(msg)
-        except Exception:
-            pass
+		raise RuntimeError("Unable to connect or bind Genesis runtime on scanned ports")
 
-    def send(self, method: str, params: dict, msg_id: int | None = 1) -> None:
-        """Send a JSON-RPC request to the runtime (thread-safe)."""
-        if self._ws is None or self._loop is None:
-            return
-        payload = json.dumps({
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "method": method,
-            "params": params,
-        }, ensure_ascii=False)
+	async def _recv_loop(self) -> None:
+		if self._ws is None:
+			return
+		try:
+			async for raw in self._ws:
+				message = json.loads(raw)
+				self._on_message(message)
+		except Exception as exc:
+			logger.warning("Runtime receive loop closed: %s", exc)
 
-        asyncio.run_coroutine_threadsafe(self._ws.send(payload), self._loop)
+	def send(self, method: str, params: dict, msg_id: int | None = None) -> None:
+		if self._loop is None or self._ws is None:
+			return
+		payload: dict[str, Any] = {
+			"jsonrpc": "2.0",
+			"method": method,
+			"params": params,
+		}
+		if msg_id is not None:
+			payload["id"] = msg_id
+		encoded = json.dumps(payload, ensure_ascii=False)
+		asyncio.run_coroutine_threadsafe(self._ws.send(encoded), self._loop)
 
-    def wait_connected(self, timeout: float = 5.0) -> bool:
-        return self._connected.wait(timeout)
+	def wait_connected(self, timeout: float = 8.0) -> bool:
+		return self._connected.wait(timeout)
+
+	@property
+	def runtime_port(self) -> int | None:
+		return self._runtime_port
 
 
-# ── Shell ────────────────────────────────────────────────────────────
+# ━━━━━━━━━━━━━━━━━━━  Shell  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class GenesisStudioShell:
-    def __init__(self, page: ui.Page, paths: Any) -> None:
-        self.page = page
-        self.paths = paths
+	"""Top-level application controller — wires UI, bridge, and events."""
 
-        self.state = type("S", (), {"show_terminal": False})()
-        self.terminal_view_html: ui.HtmlView | None = None
-        self.terminal_container: TerminalContainer | None = None
-        self.chat_page: ChatPage | None = None
+	# ── Colour tokens ──────────────────────────────────────────────
+	_BG          = "#F8F9FB"
+	_SURFACE     = "#FFFFFF"
+	_BORDER      = "#C5C5C5"
+	_TEXT         = "#1A1A2E"
+	_MUTED        = "#6B7280"
+	_ACCENT       = "#6366F1"
+	_ACCENT_LIGHT = "#EEF2FF"
 
-        # Session state
-        self.current_session_id: str | None = None
-        self._last_delta_flush = 0.0
+	def __init__(self, page: ui.Page, paths: AppPaths | None = None) -> None:
+		self.page     = page
+		self.paths    = paths or resolve_paths()
+		self.settings = RuntimeSettings()
 
-        # Runtime bridge
-        self.bridge = RuntimeBridge(on_message=self._on_runtime_message)
+		self.chat_page = ChatPage()
+		self.sidebar   = SidebarView(width=280)
+		self.terminal  = TerminalContainer(self.paths)
 
-    def mount(self) -> None:
-        self.page.title = "Genesis Studio"
-        self.render()
-        # Launch the runtime in the background
-        self.bridge.start()
-        # Wait for connection, then initialize
-        threading.Thread(target=self._init_session, daemon=True).start()
+		self.current_session_id: str | None = None
+		self._sessions: list[dict[str, Any]] = []
+		self._request_ids   = count(100)
+		self._last_delta_refresh = 0.0
+		self._terminal_visible   = False
+		self._ui_loop: asyncio.AbstractEventLoop | None = None
 
-    def _init_session(self) -> None:
-        """Called from a background thread after runtime connects."""
-        if not self.bridge.wait_connected(timeout=5.0):
-            return
-        self.bridge.send("workspace.set", {"root": str(Path.cwd())}, msg_id=99)
-        self.bridge.send("session.list", {}, msg_id=103)
-        # Create a default session
-        self.bridge.send("session.create", {"title": "New Conversation"}, msg_id=100)
+		self.bridge = RuntimeBridge(
+			on_message=self._on_runtime_message,
+			settings=self.settings,
+		)
 
-    def render(self) -> None:
-        self.page.root = self._build_window()
-        self.page.update()
+	# ── Mount ───────────────────────────────────────────────────────
 
-    # ── UI Building ──────────────────────────────────────────────────
+	def mount(self) -> None:
+		try:
+			self._ui_loop = asyncio.get_running_loop()
+		except RuntimeError:
+			self._ui_loop = None
 
-    def _build_window(self) -> ui.SplitPane:
-        return ui.SplitPane(
-            self._build_sidebar(),
-            self._build_main_panel(),
-            axis="horizontal",
-            initial_first_size=300,
-            min_first_size=200,
-            min_second_size=200,
-            expand=True,
-        )
+		self.page.title = "Genesis Studio"
 
-    def _build_sidebar(self) -> ui.Container:
-        conversations = []
-        sv = SidebarView(conversations=conversations, width=300)
-        sv.on_select(self._on_sidebar_select)
-        sv.on_new(self._on_new_conversation)
-        self._sidebar_view = sv
-        return sv.build()
+		# Register high-level callbacks on sidebar
+		self.sidebar.on_new(self._on_new_chat)
+		self.sidebar.on_select(self._open_session)
+		self.sidebar.on_refresh(self._on_refresh_sessions)
 
-    def _build_main_panel(self) -> ui.Column:
-        chat = ChatPage(self.page, self.paths)
-        self.chat_page = chat
-        chat.on_send(self._send_message)
-        chat.on_toggle_terminal(self._toggle_terminal)
+		# Build the root widget tree
+		self.page.root = self._build_root()
 
-        # Toolbar with terminal icon button
-        toolbar = ui.Container(
-            ui.Row(
-                ui.Spacer(),
-                ui.Button(
-                    text="🖥️",
-                    variant="text",
-                    bgcolor="#4F46E5",
-                    on_click=self._toggle_terminal,
-                    width=44,
-                ),
-            ),
-            padding=6,
-        )
+		# ── Explicit event binding (belt-and-suspenders) ──
+		session = self.page.session
 
-        return ui.Column(toolbar, chat.build(), spacing=6, expand=True)
+		# Composer: submit/send + text tracking
+		self.chat_page.composer.on_submit(session, self._on_send)
+		self.chat_page.composer.on_change(session, self.chat_page.on_composer_change)
+		try:
+			self.chat_page.composer.on_event(session, "send", self._on_send)
+		except Exception:
+			pass
 
-    # ── Sidebar Events ───────────────────────────────────────────────
+		# Sidebar buttons
+		self.sidebar.bind_events(session)
 
-    def _on_sidebar_select(self, conv_id: str) -> None:
-        self.current_session_id = conv_id
-        self.bridge.send("session.open", {"session_id": conv_id}, msg_id=101)
+		# Terminal toggle icon
+		self._terminal_toggle.on_click(session, self._toggle_terminal)
 
-    def _on_new_conversation(self) -> None:
-        self.bridge.send("session.create", {"title": "New Conversation"}, msg_id=102)
+		# Terminal webview message bridge
+		self.terminal.attach_event_handler(session, self._on_terminal_message)
 
-    # ── Chat Events ──────────────────────────────────────────────────
+		self._request_ui_refresh()
 
-    def _send_message(self, text: str | None = None) -> None:
-        if self.chat_page is None:
-            return
+		# Background: start runtime bridge & post-connect init
+		self.bridge.start()
+		threading.Thread(target=self._post_connect_init, daemon=True).start()
 
-        if text is None:
-            text = getattr(self.chat_page.composer, "value", None) or \
-                   getattr(self.chat_page.composer, "text", None)
-        if not text or not text.strip():
-            return
+	# ── Root layout ─────────────────────────────────────────────────
 
-        # Show user message in UI immediately
-        self.chat_page.add_user_message(text.strip())
-        self.chat_page.clear_composer()
-        self.page.update()
+	def _build_root(self):
+		# Terminal toggle in top toolbar
+		self._terminal_toggle = ui.Button(
+			text="Terminal",
+			variant="outlined",
+			events=["click"],
+			style={
+				"font_size": "12",
+				"font_weight": "600",
+				"border_radius": "8",
+				"border_color": "self._TEXT",
+				"color": "self._ACCENT",
+				"padding_horizontal": "12",
+				"padding_vertical": "4",
+			},
+		)
 
-        # Send to runtime
-        if self.current_session_id:
-            self.bridge.send("chat.send", {
-                "session_id": self.current_session_id,
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": text.strip()}],
-                },
-            }, msg_id=200)
-            self.bridge.send("ui.event", {
-                "type": "chat.send",
-                "payload": {
-                    "session_id": self.current_session_id,
-                    "chars": len(text.strip()),
-                },
-            }, msg_id=None)
+		toolbar = ui.Surface(
+			ui.Row(
+				ui.Spacer(),
+				self._terminal_toggle,
+				spacing=6,
+			),
+			padding={"left": "12", "right": "12", "top": "6", "bottom": "6"},
+			bgcolor="#FFFFFF",
+			border_color="rgba(0,0,0,0.06)",
+			border_width="1",
+		)
 
-    # ── Runtime Message Handler ──────────────────────────────────────
+		chat_surface = ui.Column(
+			toolbar,
+			self.chat_page.build(),
+			spacing="0",
+			expand=True,
+		)
 
-    def _on_runtime_message(self, msg: dict) -> None:
-        """Called from the bridge thread when a message arrives from the runtime."""
-        # Handle JSON-RPC responses (have "id")
-        msg_id = msg.get("id")
-        if msg_id is not None and "result" in msg:
-            self._handle_response(msg_id, msg["result"])
-            return
+		# Terminal area — starts hidden (height=0)
+		self.terminal_view = self.terminal.build()
+		self._terminal_slot = ui.Container(
+			self.terminal_view, height="0",
+			style={"overflow": "hidden"},
+		)
 
-        # Handle notifications (have "method")
-        method = msg.get("method")
-        params = msg.get("params", {})
-        if method is None:
-            return
+		right = ui.Column(chat_surface, self._terminal_slot, spacing="0", expand=True)
 
-        if method == "chat.begin":
-            mid = params.get("message_id", "")
-            if self.chat_page:
-                self.chat_page.begin_streaming(mid)
-                self.page.update()
+		return ui.SplitPane(
+			self.sidebar.build(),
+			right,
+			axis="horizontal",
+			ratio="0.22",
+			min_ratio="0.15",
+			max_ratio="0.35",
+			draggable=True,
+			divider_size="1",
+		)
 
-        elif method == "chat.delta":
-            mid = params.get("message_id", "")
-            delta = params.get("delta", "")
-            if self.chat_page:
-                self.chat_page.add_delta(mid, delta)
-                now = time.monotonic()
-                if (now - self._last_delta_flush) >= 0.04:
-                    self._last_delta_flush = now
-                    self.page.update()
+	# ── Post-connect init ───────────────────────────────────────────
 
-        elif method == "chat.message":
-            message = params.get("message", {})
-            mid = message.get("id", "")
-            content = message.get("content", [])
-            full_text = ""
-            if isinstance(content, list):
-                full_text = " ".join(
-                    p.get("text", "") for p in content if isinstance(p, dict)
-                )
-            if self.chat_page:
-                self.chat_page.finalize_message(mid, full_text)
-                self.page.update()
+	def _post_connect_init(self) -> None:
+		if not self.bridge.wait_connected(10.0):
+			self.chat_page.set_status("Runtime unavailable")
+			self._request_ui_refresh()
+			return
 
-        elif method == "tool.call":
-            tool_name = params.get("tool", "")
-            if self.terminal_container is not None:
-                self.terminal_container.send_output(
-                    self.page.session,
-                    f"\r\n[tool.call] {tool_name}\r\n",
-                )
+		runtime_port = self.bridge.runtime_port
+		self.chat_page.set_status(
+			f"Connected · port {runtime_port}" if runtime_port else "Connected"
+		)
+		self.bridge.send("workspace.set", {"root": str(Path.cwd())}, msg_id=next(self._request_ids))
+		self.bridge.send("session.list", {}, msg_id=next(self._request_ids))
+		self.bridge.send("session.create", {"title": "New Conversation"}, msg_id=next(self._request_ids))
 
-        elif method == "tool.result":
-            tool_id = params.get("id", "")
-            ok = params.get("ok", False)
-            status = "ok" if ok else "error"
-            if self.terminal_container is not None:
-                self.terminal_container.send_output(
-                    self.page.session,
-                    f"[tool.result] {tool_id} {status}\r\n",
-                )
+	# ── Terminal toggle ─────────────────────────────────────────────
 
-        elif method == "session.updated":
-            # Refresh sidebar
-            self.bridge.send("session.list", {}, msg_id=103)
+	def _toggle_terminal(self, event=None) -> None:
+		self._terminal_visible = not self._terminal_visible
+		new_height = 300 if self._terminal_visible else 0
+		self._terminal_slot.props["height"] = new_height
+		try:
+			self.page.session.update_props(self._terminal_slot.control_id, {"height": new_height})
+		except Exception:
+			pass
+		if self._terminal_visible:
+			self.terminal.open(self.page.session)
+			self.terminal.send_output(self.page.session, "\r\nGenesis terminal opened\r\n")
+		self._request_ui_refresh()
 
-        elif method == "log.append":
-            line = params.get("line", "")
-            print(f"[Genesis] {line}")
+	# ── Terminal messages (from WebView JS) ─────────────────────────
 
-    def _handle_response(self, msg_id: int, result: dict) -> None:
-        """Handle JSON-RPC responses to our requests."""
-        if msg_id == 100 or msg_id == 102:
-            # session.create response
-            sid = result.get("session_id")
-            if sid:
-                self.current_session_id = sid
-                if self.chat_page:
-                    title = result.get("title", "New Conversation")
-                    self.chat_page.set_title(title)
-                    self.page.update()
-                # Refresh sidebar
-                self.bridge.send("session.list", {}, msg_id=103)
+	def _on_terminal_message(self, msg=None) -> None:
+		if msg is None:
+			return
+		# msg may arrive as event object or raw dict
+		payload = msg if isinstance(msg, dict) else getattr(msg, "data", msg)
+		if isinstance(payload, str):
+			try:
+				payload = json.loads(payload)
+			except Exception:
+				payload = {"type": "raw", "data": payload}
+		if not isinstance(payload, dict):
+			return
 
-        elif msg_id == 103:
-            # session.list response
-            sessions = result.get("sessions", [])
-            if hasattr(self, "_sidebar_view"):
-                self._sidebar_view.set_conversations([
-                    {"id": s["id"], "title": s["title"]}
-                    for s in sessions
-                ])
-                self.page.update()
+		# Handle terminal close action from the terminal's close button
+		if payload.get("type") == "control" and payload.get("action") == "close":
+			self._terminal_visible = False
+			self._terminal_slot.props["height"] = 0
+			try:
+				self.page.session.update_props(self._terminal_slot.control_id, {"height": 0})
+			except Exception:
+				pass
+			self._request_ui_refresh()
+			return
 
-        elif msg_id == 101:
-            # session.open response — load messages into chat
-            messages = result.get("messages", [])
-            if self.chat_page:
-                title = result.get("title")
-                if isinstance(title, str) and title.strip():
-                    self.chat_page.set_title(title)
-                # Clear existing messages
-                self.chat_page.chat_thread.children.clear()
-                for m in messages:
-                    role = m.get("role", "user")
-                    content = m.get("content", [])
-                    text = ""
-                    if isinstance(content, list):
-                        text = " ".join(
-                            p.get("text", "") for p in content if isinstance(p, dict)
-                        )
-                    if role == "user":
-                        self.chat_page.add_user_message(text)
-                    elif role == "assistant":
-                        self.chat_page.add_assistant_message(text)
-                self.page.update()
+		# Forward as a runtime event
+		self.bridge.send(
+			"ui.event",
+			{"type": f"terminal.{payload.get('type', 'unknown')}", "payload": payload},
+			msg_id=None,
+		)
 
-        elif msg_id == 300:
-            if self.terminal_container is None:
-                return
-            if result.get("ok"):
-                data = result.get("result", {})
-                rendered = json.dumps(data, ensure_ascii=False, indent=2)
-                self.terminal_container.send_output(
-                    self.page.session,
-                    f"{rendered}\r\n",
-                )
-            else:
-                self.terminal_container.send_output(
-                    self.page.session,
-                    f"ERROR: {result.get('error', 'unknown')}\r\n",
-                )
+		# Simple built-in command handling
+		if payload.get("type") == "input":
+			command = str(payload.get("data", "")).strip()
+			if not command:
+				return
+			args = {"root": "."} if command == "ls" else {"root": command}
+			self.bridge.send(
+				"tool.call",
+				{"tool": "fs.list", "args": args},
+				msg_id=next(self._request_ids),
+			)
 
-    # ── Terminal ─────────────────────────────────────────────────────
+	# ── Send message ────────────────────────────────────────────────
 
-    def _on_terminal_message(self, msg: dict[str, Any]) -> None:
-        payload = msg.get("payload", msg)
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = {"type": "raw", "data": payload}
+	def _on_send(self, event=None) -> None:
+		# Try to extract text from the event payload first
+		text = ""
+		if event is not None:
+			if isinstance(event, dict):
+				text = str(event.get("value", event.get("data", ""))).strip()
+			else:
+				val = getattr(event, "value", None) or getattr(event, "data", None)
+				if val:
+					text = str(val).strip()
+		if not text:
+			text = self.chat_page.get_composer_text()
+		if not text:
+			return
+		if not self.current_session_id:
+			self.chat_page.set_status("No active session")
+			self._request_ui_refresh()
+			return
 
-        if not isinstance(payload, dict):
-            return
+		self.chat_page.add_user_message(text)
+		self.chat_page.clear_composer()
+		self.chat_page.set_status("Waiting for response…")
+		self._request_ui_refresh()
 
-        event_type = payload.get("type", "terminal.unknown")
-        self.bridge.send("ui.event", {
-            "type": f"terminal.{event_type}",
-            "payload": payload,
-        }, msg_id=None)
+		outbound_text = text
+		if self.chat_page.use_genesis_context():
+			context_blob, stats = self._build_genesis_context()
+			self.chat_page.set_context_info(
+				f"Context: {stats['files']} files · {stats['chars']} chars"
+			)
+			if context_blob:
+				outbound_text = (
+					"You are Genesis running locally. Use the following source context "
+					"for accuracy.\n\n"
+					"[Genesis Source Context Start]\n"
+					f"{context_blob}\n"
+					"[Genesis Source Context End]\n\n"
+					"User request:\n"
+					f"{text}"
+				)
+		else:
+			self.chat_page.set_context_info("Context: disabled")
 
-        if event_type == "input":
-            command = str(payload.get("data", "")).strip()
-            if command:
-                self.bridge.send("tool.call", {
-                    "tool": "fs.list",
-                    "args": {"root": "." if command == "ls" else command},
-                }, msg_id=300)
+		self.bridge.send(
+			"chat.send",
+			{
+				"session_id": self.current_session_id,
+				"message": {"role": "user", "content": [{"type": "text", "text": outbound_text}]},
+			},
+			msg_id=next(self._request_ids),
+		)
 
-    def _start_terminal_process(self, html_view: ui.HtmlView | None) -> None:
-        try:
-            if html_view is not None:
-                html_view.invoke(
-                    self.page.session,
-                    "postMessage",
-                    {"payload": {"type": "output", "data": "Welcome to Genesis Shell\r\n"}},
-                )
-        except Exception:
-            pass
+	# ── Sidebar callbacks ───────────────────────────────────────────
 
-    def _toggle_terminal(self, event=None) -> None:
-        if not self.state.show_terminal:
-            self.state.show_terminal = True
-            if self.terminal_container is None:
-                self.terminal_container = TerminalContainer(self.paths)
-                view = self.terminal_container.build()
-                self.terminal_view_html = view
-                view.on_event(self.page.session, "message", self._on_terminal_message)
-            else:
-                view = self.terminal_view_html
+	def _on_new_chat(self, event=None) -> None:
+		self.bridge.send(
+			"session.create", {"title": "New Conversation"},
+			msg_id=next(self._request_ids),
+		)
 
-            try:
-                if self.chat_page is not None and view is not None:
-                    self.chat_page.attach_terminal(view)
-                    self.page.update()
-            except Exception:
-                pass
+	def _on_refresh_sessions(self, event=None) -> None:
+		self.bridge.send("session.list", {}, msg_id=next(self._request_ids))
 
-            try:
-                def do_open():
-                    if self.terminal_container is not None and self.page is not None:
-                        self.terminal_container.open(self.page.session)
-                        self.page.update()
+	def _open_session(self, session_id: str) -> None:
+		self.current_session_id = session_id
+		self.sidebar.set_active(session_id)
+		self.bridge.send(
+			"session.open", {"session_id": session_id},
+			msg_id=next(self._request_ids),
+		)
+		self._request_ui_refresh()
 
-                threading.Timer(0.05, do_open).start()
-            except Exception:
-                pass
+	# ── Runtime message dispatcher ──────────────────────────────────
 
-            self._start_terminal_process(self.terminal_view_html)
-        else:
-            self.state.show_terminal = False
-            try:
-                if self.terminal_container is not None:
-                    self.terminal_container.close(self.page.session)
-                    self.page.update()
-            except Exception:
-                pass
-            threading.Timer(0.4, self._delayed_detach).start()
+	def _on_runtime_message(self, message: dict) -> None:
+		# JSON-RPC response (success)
+		if "id" in message and "result" in message:
+			self._handle_response(message["result"])
+			return
 
-    def _delayed_detach(self) -> None:
-        try:
-            if not self.state.show_terminal:
-                if self.chat_page is not None:
-                    self.chat_page.detach_terminal()
-                self.page.update()
-        except Exception:
-            pass
+		# JSON-RPC response (error)
+		if "id" in message and "error" in message:
+			err = message.get("error", {})
+			msg = err.get("message") if isinstance(err, dict) else str(err)
+			self.chat_page.set_status(f"Runtime error: {msg}")
+			self._request_ui_refresh()
+			return
+
+		method = message.get("method")
+		params = message.get("params", {})
+
+		if method == "session.updated":
+			self.bridge.send("session.list", {}, msg_id=next(self._request_ids))
+			return
+
+		if method == "chat.begin":
+			message_id = params.get("message_id")
+			if message_id:
+				self.chat_page.begin_streaming(message_id)
+				self._request_ui_refresh()
+			return
+
+		if method == "chat.delta":
+			message_id = params.get("message_id")
+			if not message_id:
+				return
+			self.chat_page.add_delta(message_id, params.get("delta", ""))
+			now = time.monotonic()
+			if now - self._last_delta_refresh >= 0.05:
+				self._last_delta_refresh = now
+				self._request_ui_refresh()
+			return
+
+		if method == "chat.message":
+			msg = params.get("message", {})
+			content = msg.get("content", [])
+			text = ""
+			if isinstance(content, list):
+				text = "".join(
+					part.get("text", "") for part in content if isinstance(part, dict)
+				)
+			self.chat_page.finalize_stream(msg.get("id", ""), text)
+			self._request_ui_refresh()
+			return
+
+		if method == "tool.result" and self._terminal_visible:
+			ok = bool(params.get("ok", False))
+			result = params.get("result", {}) if isinstance(params, dict) else {}
+			if ok and isinstance(result, dict) and isinstance(result.get("items"), list):
+				lines = []
+				for item in result["items"]:
+					name = item.get("name", "")
+					suffix = "/" if item.get("is_dir") else ""
+					lines.append(f"{name}{suffix}")
+				rendered = "\r\n".join(lines) + "\r\n"
+			else:
+				rendered = json.dumps(params, ensure_ascii=False, indent=2) + "\r\n"
+			self.terminal.send_output(self.page.session, rendered)
+
+		if method == "log.append":
+			line = params.get("line")
+			if isinstance(line, str) and line.strip():
+				self.chat_page.set_status(line)
+				self._request_ui_refresh()
+
+	def _handle_response(self, result: dict) -> None:
+		if "sessions" in result:
+			self._sessions = result.get("sessions", [])
+			if not self.current_session_id and self._sessions:
+				self.current_session_id = self._sessions[0].get("id")
+			self.sidebar.set_sessions(self._sessions, self.current_session_id)
+			self._request_ui_refresh()
+			return
+
+		if "session_id" in result and "title" in result and "messages" not in result:
+			self.current_session_id = result.get("session_id")
+			self.sidebar.set_active(self.current_session_id)
+			self.chat_page.set_title(result.get("title", "Genesis"))
+			self.chat_page.clear_messages()
+			self.bridge.send(
+				"session.open",
+				{"session_id": self.current_session_id},
+				msg_id=next(self._request_ids),
+			)
+			self._request_ui_refresh()
+			return
+
+		if "messages" in result:
+			self.chat_page.clear_messages()
+			self.chat_page.set_title(result.get("title", "Genesis"))
+			for item in result.get("messages", []):
+				role = item.get("role", "assistant")
+				content = item.get("content", [])
+				text = ""
+				if isinstance(content, list):
+					text = "".join(
+						part.get("text", "") for part in content if isinstance(part, dict)
+					)
+				if role == "user":
+					self.chat_page.add_user_message(text)
+				elif role == "assistant":
+					self.chat_page.add_assistant_message(text)
+			self._request_ui_refresh()
+
+	# ── UI refresh helper ───────────────────────────────────────────
+
+	def _request_ui_refresh(self) -> None:
+		if self._ui_loop is None:
+			try:
+				self.page.update()
+			except Exception:
+				pass
+			return
+		try:
+			self._ui_loop.call_soon_threadsafe(self.page.update)
+		except Exception:
+			try:
+				self.page.update()
+			except Exception:
+				pass
+
+	# ── Genesis source-context builder ──────────────────────────────
+
+	def _build_genesis_context(
+		self, max_files: int = 12, max_chars: int = 24000,
+	) -> tuple[str, dict[str, int]]:
+		genesis_root = self.paths.root / "genesis"
+		if not genesis_root.exists():
+			return "", {"files": 0, "chars": 0}
+
+		selected_parts: list[str] = []
+		total_chars = 0
+		used_files  = 0
+
+		candidates = sorted(genesis_root.rglob("*.py"))
+		for file_path in candidates:
+			if used_files >= max_files or total_chars >= max_chars:
+				break
+			try:
+				text = file_path.read_text(encoding="utf-8", errors="replace")
+			except Exception:
+				continue
+
+			remaining = max_chars - total_chars
+			if remaining <= 0:
+				break
+
+			snippet = text[:remaining]
+			rel = file_path.relative_to(self.paths.root).as_posix()
+			block = f"# FILE: {rel}\n{snippet}\n"
+			selected_parts.append(block)
+			total_chars += len(block)
+			used_files += 1
+
+		return "\n".join(selected_parts), {"files": used_files, "chars": total_chars}

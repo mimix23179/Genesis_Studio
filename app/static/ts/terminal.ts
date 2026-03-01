@@ -1,14 +1,20 @@
+export type TerminalInputMessage = { type: "input"; data: string };
+export type TerminalOutputMessage = { type: "output"; data: string };
+export type TerminalControlMessage = { type: "control"; action: "open" | "close" };
+
 export type TerminalBridgeMessage =
-	| { type: "input"; data: string }
-	| { type: "output"; data: string }
-	| { type: "control"; action: "open" | "close" }
-	| { type: "editor.changed"; path: string; text: string }
-	| { type: "editor.requestOpen"; path: string };
+	| TerminalInputMessage
+	| TerminalOutputMessage
+	| TerminalControlMessage;
 
 declare global {
 	interface Window {
 		flutter_inappwebview?: {
 			callHandler?: (name: string, payload: unknown) => void;
+		};
+		__TERMINAL_PAYLOAD__?: {
+			welcome?: string;
+			motd?: string[];
 		};
 	}
 }
@@ -17,12 +23,20 @@ export function sendToHost(message: TerminalBridgeMessage): void {
 	try {
 		window.flutter_inappwebview?.callHandler?.("message", { payload: message });
 	} catch {
-		// no-op for host without this bridge
+		// ignore bridge errors
 	}
 
 	try {
 		window.parent.postMessage({ payload: message }, "*");
 	} catch {
-		// no-op for host without postMessage
+		// ignore postMessage errors
 	}
+}
+
+export function createOutput(text: string): TerminalOutputMessage {
+	return { type: "output", data: text };
+}
+
+export function createControl(action: "open" | "close"): TerminalControlMessage {
+	return { type: "control", action };
 }

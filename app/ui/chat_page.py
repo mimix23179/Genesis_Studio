@@ -1,197 +1,225 @@
-"""Chat page built entirely with native ButterflyUI components.
-
-Uses ChatThread, ChatMessage, TypingIndicator, and MessageComposer
-instead of raw Column+Text widgets.
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Callable, Dict, Optional
+import time
+from typing import Any, Dict
 
 import butterflyui as ui
 
 
-@dataclass
 class ChatPage:
-    page: ui.Page
-    paths: object
+	"""Chat workspace — polished layout built entirely from ButterflyUI controls.
 
-    def __post_init__(self) -> None:
-        self._on_send: Optional[Callable[[Optional[str]], None]] = None
-        self._on_toggle_terminal: Optional[Callable[[], None]] = None
+	Exposes the ``composer`` (MessageComposer with built-in send button),
+	streaming helpers, and context-toggle switch. All interactive controls carry
+	``events=[…]`` so the Flutter runtime subscribes immediately; the shell
+	then calls ``.on_submit(session, handler)`` etc. for explicit binding.
+	"""
 
-        # Header
-        self.title = ui.Text("New Conversation", style={"font_size": 20, "font_weight": 700})
+	# ── Colour tokens ──────────────────────────────────────────────
+	_BG          = "#F8F9FB"
+	_SURFACE     = "#FFFFFF"
+	_BORDER      = "#C5C5C5"
+	_TEXT         = "#1A1A2E"
+	_MUTED        = "#6B7280"
+	_ACCENT       = "#6366F1"
+	_ACCENT_LIGHT = "#EEF2FF"
 
-        # Chat thread — native ButterflyUI component
-        self.chat_thread = ui.ChatThread(expand=True)
+	def __init__(self) -> None:
+		# ── Header ──
+		self.title = ui.Text(
+			"Genesis",
+			style={"font_size": 22, "font_weight": 700, "color": "self._TEXT"},
+		)
+		self.subtitle = ui.Text(
+			"Self-contained local runtime",
+			style={"font_size": 12, "color": "self._MUTED"},
+		)
 
-        # Typing indicator — shown when the brain is streaming
-        self.typing_indicator = ui.TypingIndicator(visible=False)
+		# ── Chat thread ──
+		self.chat_thread = ui.ChatThread(
+			expand=True, auto_scroll=True, spacing=10, group_messages=True,
+			style={"padding": "12"},
+		)
+		self.typing_indicator = ui.TypingIndicator(visible=False)
 
-        # Composer
-        self.composer = ui.TextArea(
-            placeholder="Ask Genesis Studio...",
-            min_lines=2,
-            max_lines=6,
-            expand=True,
-        )
-        self.send_btn = ui.Button(
-            text="Send 💬",
-            variant="filled",
-            on_click=self._handle_send,
-            width=120,
-        )
+		# ── Composer area ──
+		self._composer_value: str = ""
+		self.composer = ui.MessageComposer(
+			placeholder="Message Genesis…",
+			send_label="Send",
+			clear_on_send=True,
+			emit_on_change=True,
+			min_lines=1,
+			max_lines=4,
+			events=["submit", "change", "send"],
+			style={
+				"font_size": "14",
+				"border_radius": "12",
+				"border_color": "self._BORDER",
+				"background": "self._SURFACE",
+			},
+		)
 
-        # Terminal slot — injectable Column where the terminal HtmlView attaches
-        self.terminal_slot = ui.Column()
-        self.terminal_visible = False
+		# ── Context toggle ──
+		self.context_switch = ui.Switch(
+			value=True, 
+			label="Genesis source context", 
+			inline=True,
+			events=["change"],
+		)
+		self.context_info = ui.Text(
+			"Context: ready",
+			style={"font_size": 11, "color": "self._MUTED"},
+		)
 
-        # Streaming state: message_id -> accumulated text
-        self._streaming: Dict[str, str] = {}
-        self._streaming_widgets: Dict[str, ui.ChatMessage] = {}
+		# ── Status bar ──
+		self.status_text = ui.Text(
+			"Idle",
+			style={"font_size": 11, "color": "self._MUTED"},
+		)
 
-    # ── Event Handlers ───────────────────────────────────────────────
+		# ── Streaming state ──
+		self._streaming_text: Dict[str, str] = {}
+		self._streaming_widgets: Dict[str, Any] = {}
 
-    def _handle_send(self, event=None) -> None:
-        text = getattr(self.composer, "value", None) or getattr(self.composer, "text", None)
-        if callable(self._on_send):
-            try:
-                self._on_send(text)
-            except Exception:
-                pass
+	# ── Layout ──────────────────────────────────────────────────────
 
-    def _handle_toggle(self, event=None) -> None:
-        if callable(self._on_toggle_terminal):
-            try:
-                self._on_toggle_terminal()
-            except Exception:
-                pass
+	def build(self) -> ui.Column:
+		header = ui.Surface(
+			ui.Row(
+				ui.Column(self.title, self.subtitle, spacing=2),
+				ui.Spacer(),
+				ui.Text(
+					"●",
+					style={"font_size": "10", "color": "self._ACCENT"},
+				),
+				spacing=8,
+			),
+			padding="16", bgcolor="self._SURFACE",
+			border_color="self._BORDER", border_width="1", radius="14",
+		)
 
-    # ── Public API ───────────────────────────────────────────────────
+		messages = ui.Container(
+			ui.Column(self.chat_thread, self.typing_indicator, spacing=6, expand=True),
+			expand=True,
+			style={"background": "self._BG", "border_radius": "12"},
+		)
 
-    def on_send(self, callback: Callable[[Optional[str]], None]) -> None:
-        self._on_send = callback
+		context_row = ui.Container(
+			ui.Row(self.context_switch, ui.Spacer(), self.context_info, spacing=8),
+			padding={"left": 12, "right": 12, "top": 6, "bottom": 2},
+		)
 
-    def on_toggle_terminal(self, callback: Callable[[], None]) -> None:
-        self._on_toggle_terminal = callback
+		composer_row = ui.Surface(
+			self.composer,
+			padding="10", bgcolor="self._SURFACE",
+			border_color="self._BORDER", border_width="1", radius="14",
+		)
 
-    def build(self) -> ui.Column:
-        composer_row = ui.Container(
-            ui.Row(
-                ui.Expanded(child=self.composer),
-                ui.Column(ui.Row(self.send_btn)),
-            ),
-            padding=12,
-        )
-        header = ui.Container(
-            ui.Row(self.title, ui.Spacer()),
-            padding=8,
-        )
-        # Terminal slot placed below composer so it appears from the bottom
-        terminal_container = ui.Container(self.terminal_slot, padding=0)
+		status_bar = ui.Container(
+			ui.Row(self.status_text, ui.Spacer()),
+			padding={"left": 12, "right": 12, "top": 2, "bottom": 6},
+		)
 
-        return ui.Column(
-            header,
-            ui.Expanded(child=ui.Container(
-                ui.Column(self.chat_thread, self.typing_indicator, spacing=4, expand=True),
-                padding=8,
-            )),
-            composer_row,
-            terminal_container,
-            spacing=12,
-            expand=True,
-        )
+		return ui.Column(
+			ui.Container(header, padding={"left": 12, "right": 12, "top": 12, "bottom": 4}),
+			messages,
+			context_row,
+			ui.Container(composer_row, padding={"left": 12, "right": 12, "top": 2, "bottom": 2}),
+			status_bar,
+			spacing=0,
+			expand=True,
+		)
 
-    # ── Message Management ───────────────────────────────────────────
+	# ── Composer helpers ────────────────────────────────────────────
 
-    def add_user_message(self, text: str) -> None:
-        """Add a user message bubble to the chat thread."""
-        msg = ui.ChatMessage(
-            text=text,
-            sender="user",
-            alignment="end",
-        )
-        self.chat_thread.children.append(msg)
+	def on_composer_change(self, event=None) -> None:
+		"""Track composer text from change events dispatched by the runtime."""
+		if event is None:
+			return
+		if isinstance(event, dict):
+			self._composer_value = str(event.get("value", event.get("data", "")))
+		elif hasattr(event, "value") and event.value is not None:
+			self._composer_value = str(event.value)
+		elif hasattr(event, "data") and event.data is not None:
+			self._composer_value = str(event.data)
 
-    def add_assistant_message(self, text: str) -> None:
-        """Add a finalized assistant message bubble."""
-        msg = ui.ChatMessage(
-            text=text,
-            sender="assistant",
-            alignment="start",
-        )
-        self.chat_thread.children.append(msg)
+	def get_composer_text(self) -> str:
+		return self._composer_value.strip()
 
-    def begin_streaming(self, message_id: str) -> None:
-        """Show typing indicator when streaming begins."""
-        self._streaming[message_id] = ""
-        bubble = ui.ChatMessage(
-            text="",
-            sender="assistant",
-            alignment="start",
-        )
-        self._streaming_widgets[message_id] = bubble
-        self.chat_thread.children.append(bubble)
-        self.typing_indicator.visible = True
+	def clear_composer(self) -> None:
+		self._composer_value = ""
 
-    def add_delta(self, message_id: str, delta: str) -> None:
-        """Accumulate streaming text for a message."""
-        if message_id in self._streaming:
-            self._streaming[message_id] += delta
-            bubble = self._streaming_widgets.get(message_id)
-            if bubble is not None:
-                try:
-                    bubble.text = self._streaming[message_id]
-                except Exception:
-                    try:
-                        bubble.value = self._streaming[message_id]
-                    except Exception:
-                        pass
+	# ── Header / status helpers ─────────────────────────────────────
 
-    def finalize_message(self, message_id: str, full_text: str) -> None:
-        """Replace streaming state with the finalized assistant message."""
-        self._streaming.pop(message_id, None)
-        bubble = self._streaming_widgets.pop(message_id, None)
-        if bubble is not None:
-            try:
-                bubble.text = full_text
-            except Exception:
-                try:
-                    bubble.value = full_text
-                except Exception:
-                    pass
-        elif full_text:
-            self.add_assistant_message(full_text)
-        self.typing_indicator.visible = len(self._streaming) > 0
+	def set_title(self, title: str) -> None:
+		if title.strip():
+			self.title.patch(text=title)
 
-    def clear_composer(self) -> None:
-        """Clear the composer text area after sending."""
-        try:
-            self.composer.value = ""
-        except Exception:
-            pass
+	def set_status(self, status: str) -> None:
+		self.status_text.patch(text=status)
 
-    def set_title(self, title: str) -> None:
-        self.title.value = title
+	def set_context_info(self, text: str) -> None:
+		self.context_info.patch(text=text)
 
-    # ── Terminal Slot ────────────────────────────────────────────────
+	def use_genesis_context(self) -> bool:
+		try:
+			props = self.context_switch.to_dict().get("props", {})
+			return bool(props.get("value", False))
+		except Exception:
+			return True
 
-    def attach_terminal(self, view: ui.HtmlView) -> None:
-        if view is None:
-            return
-        self.terminal_slot.children.clear()
-        self.terminal_slot.children.append(view)
-        self.terminal_visible = True
+	# ── Message helpers ─────────────────────────────────────────────
 
-    def detach_terminal(self) -> None:
-        self.terminal_slot.children.clear()
-        self.terminal_visible = False
+	def clear_messages(self) -> None:
+		self.chat_thread.children.clear()
+		self._streaming_text.clear()
+		self._streaming_widgets.clear()
+		self.typing_indicator.patch(visible=False)
 
-    def toggle_terminal(self, view: ui.HtmlView | None = None) -> None:
-        if self.terminal_visible:
-            self.detach_terminal()
-        else:
-            if view is not None:
-                self.attach_terminal(view)
+	def add_user_message(self, text: str) -> None:
+		msg = ui.ChatMessage(
+			text=text, role="user", name="You", align="right",
+			style={"background": "self._ACCENT_LIGHT", "border_radius": "14", "padding": "10"},
+		)
+		self.chat_thread.children.append(msg)
+
+	def add_assistant_message(self, text: str) -> None:
+		msg = ui.ChatMessage(
+			text=text, role="assistant", name="Genesis", align="left",
+			style={"background": "self._SURFACE", "border_radius": "14", "padding": "10", "border_color": "self._BORDER", "border_width": "1"},
+		)
+		self.chat_thread.children.append(msg)
+
+	# ── Streaming ───────────────────────────────────────────────────
+
+	def begin_streaming(self, message_id: str) -> None:
+		if message_id in self._streaming_widgets:
+			return
+		bubble = ui.ChatMessage(
+			text="", role="assistant", name="Genesis", align="left",
+			style={"background": "self._SURFACE", "border_radius": "14", "padding": "10", "border_color": "self._BORDER", "border_width": "1"},
+		)
+		self.chat_thread.children.append(bubble)
+		self._streaming_widgets[message_id] = bubble
+		self._streaming_text[message_id] = ""
+		self.typing_indicator.patch(visible=True)
+		self.set_status("Streaming response…")
+
+	def add_delta(self, message_id: str, delta: str) -> None:
+		if message_id not in self._streaming_text:
+			return
+		self._streaming_text[message_id] += delta or ""
+		bubble = self._streaming_widgets.get(message_id)
+		if bubble is not None:
+			bubble.patch(text=self._streaming_text[message_id])
+
+	def finalize_stream(self, message_id: str, full_text: str) -> None:
+		self._streaming_text.pop(message_id, None)
+		bubble = self._streaming_widgets.pop(message_id, None)
+		if bubble is not None:
+			bubble.patch(text=full_text)
+		else:
+			self.add_assistant_message(full_text)
+		self.typing_indicator.patch(visible=len(self._streaming_widgets) > 0)
+		self.set_status("Idle")

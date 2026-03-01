@@ -1,66 +1,71 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any, Optional
+import json
+from typing import Optional
 
 import butterflyui as ui
 
-from app.utils import read_text_file, json_for_script_tag
+from app.config import AppPaths
+from app.utils import json_for_script_tag, read_json_file, read_text_file
 
 
 class TerminalContainer:
-    """Builds an HtmlView for the terminal drawer using the packaged HTML template.
+	"""Wraps xterm.js inside a ButterflyUI WebView for reliable JS execution."""
 
-    The view exposes `open()` and `close()` helpers which send control postMessage
-    payloads to the page. The host can also send `output` messages to feed data
-    to the terminal.
-    """
+	def __init__(self, paths: AppPaths) -> None:
+		self.paths = paths
+		self.view: Optional[ui.WebView] = None
 
-    def __init__(self, paths: Any) -> None:
-        self.paths = paths
-        # Corrected template name to terminal.html
-        self.template_path = paths.templates_root / "terminal.html"
-        self.static_root = paths.static_root
-        self.view: Optional[ui.HtmlView] = None
+	def build(self) -> ui.WebView:
+		template = read_text_file(self.paths.templates_root / "terminal.html")
+		css = read_text_file(self.paths.static_root / "css" / "terminal.css")
+		js = read_text_file(self.paths.static_root / "js" / "terminal.js")
 
-    def build(self) -> ui.HtmlView:
-        tpl = read_text_file(self.template_path)
-        
-        # Load CSS and JS for injection
-        css_content = read_text_file(self.static_root / "css" / "terminal.css")
-        js_content = read_text_file(self.static_root / "js" / "terminal.js")
-        
-        # include a small payload object for initial config
-        payload = json_for_script_tag({"welcome": "Genesis Shell — ready"})
-        
-        # Inject contents
-        html = tpl.replace("__COMPONENT_CSS__", css_content)
-        html = html.replace("__COMPONENT_JS__", js_content)
-        html = html.replace("</body>", f"<script>window.__TERMINAL_PAYLOAD__ = {payload};</script></body>")
-        
-        self.view = ui.HtmlView(html=html, expand=True, events=["message"], style={"background": "transparent"})
-        return self.view
+		payload = read_json_file(
+			self.paths.terminal_payload,
+			default={"welcome": "Genesis Shell ready"},
+		)
 
-    def open(self, session: Any) -> None:
-        if self.view is None:
-            return
-        try:
-            self.view.invoke(session, "postMessage", {"payload": {"type": "control", "action": "open"}})
-        except Exception:
-            pass
+		html = template.replace("__COMPONENT_CSS__", css)
+		html = html.replace("__COMPONENT_JS__", js)
+		html = html.replace(
+			"</body>",
+			f"<script>window.__TERMINAL_PAYLOAD__ = {json_for_script_tag(payload)};</script></body>",
+		)
 
-    def close(self, session: Any) -> None:
-        if self.view is None:
-            return
-        try:
-            self.view.invoke(session, "postMessage", {"payload": {"type": "control", "action": "close"}})
-        except Exception:
-            pass
+		self.view = ui.WebView(
+			html=html,
+			javascript_enabled=True,
+			dom_storage_enabled=True,
+			allow_file_access=True,
+			events=["message"],
+			style={"min_height": 0},
+		)
+		return self.view
 
-    def send_output(self, session: Any, data: str) -> None:
-        if self.view is None:
-            return
-        try:
-            self.view.invoke(session, "postMessage", {"payload": {"type": "output", "data": data}})
-        except Exception:
-            pass
+	def attach_event_handler(self, session, callback) -> None:
+		"""Bind the 'message' event so callHandler('message', …) from JS reaches Python."""
+		if self.view is None:
+			return
+		self.view.on_event(session, "message", callback)
+
+	def open(self, session) -> None:
+		"""Focus the terminal input after it becomes visible."""
+		self._run_js(session, "document.getElementById('command_input')?.focus();")
+
+	def close(self, session) -> None:
+		"""No-op; container height hides the widget."""
+		pass
+
+	def send_output(self, session, text: str) -> None:
+		"""Write text into the running xterm instance."""
+		escaped = json.dumps(text, ensure_ascii=False)
+		self._run_js(session, f"window.__genesis_receive({{type:'output',data:{escaped}}});")
+
+	def _run_js(self, session, script: str) -> None:
+		if self.view is None:
+			return
+		try:
+			self.view.run_javascript(session, script)
+		except Exception:
+			pass
