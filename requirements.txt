@@ -1,0 +1,9 @@
+﻿requests
+huggingface_hub
+bitnet
+llama-cpp-python
+sentencepiece
+transformers
+pytest
+flake8
+pydantic

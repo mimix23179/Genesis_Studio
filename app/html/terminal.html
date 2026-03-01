@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Genesis Terminal</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm/css/xterm.css" />
+    <style>
+        __COMPONENT_CSS__
+    </style>
+</head>
+<body>
+    <div id="terminal_wrap" class="terminal-wrap">
+        <div class="terminal-header">
+            <div class="left">
+                <span class="icon">🖥️</span>
+                <span class="title">GENESIS TERMINAL</span>
+            </div>
+            <div class="controls">
+                <button id="clear_btn">Clear</button>
+                <button id="copy_btn">Copy</button>
+                <button id="close_btn">Close</button>
+            </div>
+        </div>
+
+        <div id="terminal" class="terminal-container"></div>
+
+        <div class="command-input">
+            <span class="prompt">❯</span>
+            <input id="command_input" class="input-field" placeholder="Type a command..." spellcheck="false" autocomplete="off" />
+        </div>
+    </div>
+
+    <script>
+        __COMPONENT_JS__
+    </script>
+</body>
+</html>
