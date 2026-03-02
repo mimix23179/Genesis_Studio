@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 from typing import Optional
 
 import butterflyui as ui
@@ -25,6 +27,10 @@ class TerminalContainer:
 			self.paths.terminal_payload,
 			default={"welcome": "Genesis Shell ready"},
 		)
+		if not isinstance(payload, dict):
+			payload = {"welcome": "Genesis Shell ready"}
+		payload.setdefault("workspace", self.paths.root.name)
+		payload.setdefault("shell", os.environ.get("GENESIS_SHELL", "auto"))
 
 		html = template.replace("__COMPONENT_CSS__", css)
 		html = html.replace("__COMPONENT_JS__", js)
@@ -51,7 +57,7 @@ class TerminalContainer:
 
 	def open(self, session) -> None:
 		"""Focus the terminal input after it becomes visible."""
-		self._run_js(session, "document.getElementById('command_input')?.focus();")
+		self._run_js(session, "window.__genesis_terminal?.term?.focus?.();")
 
 	def close(self, session) -> None:
 		"""No-op; container height hides the widget."""
@@ -66,6 +72,21 @@ class TerminalContainer:
 		if self.view is None:
 			return
 		try:
-			self.view.run_javascript(session, script)
+			loop = asyncio.get_running_loop()
+
+			async def _invoke_async() -> None:
+				if self.view is None:
+					return
+				await self.view.invoke_async(
+					session,
+					"run_javascript",
+					{"value": script},
+					timeout=2.0,
+				)
+
+			loop.create_task(_invoke_async())
 		except Exception:
-			pass
+			try:
+				self.view.run_javascript(session, script)
+			except Exception:
+				pass

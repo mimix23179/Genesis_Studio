@@ -22,25 +22,27 @@ class ChatPage:
 	_TEXT         = "#1A1A2E"
 	_MUTED        = "#6B7280"
 	_ACCENT       = "#6366F1"
-	_ACCENT_LIGHT = "#EEF2FF"
+	_ACCENT_LIGHT = "#5078FF"
 
 	def __init__(self) -> None:
 		# ── Header ──
 		self.title = ui.Text(
 			"Genesis",
-			style={"font_size": 22, "font_weight": 700, "color": "self._TEXT"},
+			style={"font_size": "22", "font_weight": "700", "color": "self._TEXT"},
 		)
 		self.subtitle = ui.Text(
 			"Self-contained local runtime",
-			style={"font_size": 12, "color": "self._MUTED"},
+			style={"font_size": "12", "color": "self._MUTED"},
 		)
 
 		# ── Chat thread ──
 		self.chat_thread = ui.ChatThread(
+			messages=[],
 			expand=True, auto_scroll=True, spacing=10, group_messages=True,
 			style={"padding": "12"},
 		)
 		self.typing_indicator = ui.TypingIndicator(visible=False)
+		self._messages: list[dict[str, Any]] = []
 
 		# ── Composer area ──
 		self._composer_value: str = ""
@@ -69,13 +71,13 @@ class ChatPage:
 		)
 		self.context_info = ui.Text(
 			"Context: ready",
-			style={"font_size": 11, "color": "self._MUTED"},
+			style={"font_size": "11", "color": "self._MUTED"},
 		)
 
 		# ── Status bar ──
 		self.status_text = ui.Text(
 			"Idle",
-			style={"font_size": 11, "color": "self._MUTED"},
+			style={"font_size": "11", "color": "self._MUTED"},
 		)
 
 		# ── Streaming state ──
@@ -95,8 +97,11 @@ class ChatPage:
 				),
 				spacing=8,
 			),
-			padding="16", bgcolor="self._SURFACE",
-			border_color="self._BORDER", border_width="1", radius="14",
+			padding="16", 
+			bgcolor="self._SURFACE",
+			border_color="self._BORDER", 
+			border_width="1", 
+			radius="14",
 		)
 
 		messages = ui.Container(
@@ -107,25 +112,28 @@ class ChatPage:
 
 		context_row = ui.Container(
 			ui.Row(self.context_switch, ui.Spacer(), self.context_info, spacing=8),
-			padding={"left": 12, "right": 12, "top": 6, "bottom": 2},
+			padding={"left": "12", "right": "12", "top": "6", "bottom": "2"},
 		)
 
 		composer_row = ui.Surface(
 			self.composer,
-			padding="10", bgcolor="self._SURFACE",
-			border_color="self._BORDER", border_width="1", radius="14",
+			padding="10", 
+			bgcolor="self._SURFACE",
+			border_color="self._BORDER", 
+			border_width="1", 
+			radius="14",
 		)
 
 		status_bar = ui.Container(
 			ui.Row(self.status_text, ui.Spacer()),
-			padding={"left": 12, "right": 12, "top": 2, "bottom": 6},
+			padding={"left": "12", "right": "12", "top": "2", "bottom": "6"},
 		)
 
 		return ui.Column(
-			ui.Container(header, padding={"left": 12, "right": 12, "top": 12, "bottom": 4}),
+			ui.Container(header, padding={"left": "12", "right": "12", "top": "12", "bottom": "4"}),
 			messages,
 			context_row,
-			ui.Container(composer_row, padding={"left": 12, "right": 12, "top": 2, "bottom": 2}),
+			ui.Container(composer_row, padding={"left": "12", "right": "12", "top": "2", "bottom": "2"}),
 			status_bar,
 			spacing=0,
 			expand=True,
@@ -171,55 +179,85 @@ class ChatPage:
 
 	# ── Message helpers ─────────────────────────────────────────────
 
-	def clear_messages(self) -> None:
-		self.chat_thread.children.clear()
+	def _sync_thread(self, session=None) -> None:
+		fixed_messages = []
+		for msg in self._messages:
+			align = msg.get("align", "left")
+			if align == "start": align = "left"
+			if align == "end": align = "right"
+			fixed_messages.append({
+				"text": msg.get("text", ""),
+				"role": msg.get("role", "user"),
+				"align": align,
+				"name": "You" if msg.get("role") == "user" else "Genesis",
+			})
+		try:
+			if session is not None:
+				self.chat_thread.patch(session=session, messages=fixed_messages)
+		except Exception:
+			pass
+
+	def clear_messages(self, session=None) -> None:
+		self._messages.clear()
+		self._sync_thread(session)
 		self._streaming_text.clear()
 		self._streaming_widgets.clear()
 		self.typing_indicator.patch(visible=False)
 
-	def add_user_message(self, text: str) -> None:
-		msg = ui.ChatMessage(
-			text=text, role="user", name="You", align="right",
-			style={"background": "self._ACCENT_LIGHT", "border_radius": "14", "padding": "10"},
+	def add_user_message(self, text: str, session=None) -> None:
+		self._messages.append(
+			{
+				"text": text,
+				"role": "user",
+				"align": "right",
+			}
 		)
-		self.chat_thread.children.append(msg)
+		self._sync_thread(session)
 
-	def add_assistant_message(self, text: str) -> None:
-		msg = ui.ChatMessage(
-			text=text, role="assistant", name="Genesis", align="left",
-			style={"background": "self._SURFACE", "border_radius": "14", "padding": "10", "border_color": "self._BORDER", "border_width": "1"},
+	def add_assistant_message(self, text: str, session=None) -> None:
+		self._messages.append(
+			{
+				"text": text,
+				"role": "assistant",
+				"align": "left",
+			}
 		)
-		self.chat_thread.children.append(msg)
+		self._sync_thread(session)
 
 	# ── Streaming ───────────────────────────────────────────────────
 
-	def begin_streaming(self, message_id: str) -> None:
+	def begin_streaming(self, message_id: str, session=None) -> None:
 		if message_id in self._streaming_widgets:
 			return
-		bubble = ui.ChatMessage(
-			text="", role="assistant", name="Genesis", align="left",
-			style={"background": "self._SURFACE", "border_radius": "14", "padding": "10", "border_color": "self._BORDER", "border_width": "1"},
+		self._messages.append(
+			{
+				"text": "",
+				"role": "assistant",
+				"align": "left",
+			}
 		)
-		self.chat_thread.children.append(bubble)
-		self._streaming_widgets[message_id] = bubble
+		self._streaming_widgets[message_id] = len(self._messages) - 1
 		self._streaming_text[message_id] = ""
+		self._sync_thread(session)
 		self.typing_indicator.patch(visible=True)
 		self.set_status("Streaming response…")
 
-	def add_delta(self, message_id: str, delta: str) -> None:
+	def add_delta(self, message_id: str, delta: str, session=None) -> None:
 		if message_id not in self._streaming_text:
 			return
 		self._streaming_text[message_id] += delta or ""
-		bubble = self._streaming_widgets.get(message_id)
-		if bubble is not None:
-			bubble.patch(text=self._streaming_text[message_id])
+		message_index = self._streaming_widgets.get(message_id)
+		if isinstance(message_index, int) and 0 <= message_index < len(self._messages):
+			self._messages[message_index]["text"] = self._streaming_text[message_id]
+			self._sync_thread(session)
 
-	def finalize_stream(self, message_id: str, full_text: str) -> None:
+	def finalize_stream(self, message_id: str, full_text: str, session=None) -> None:
 		self._streaming_text.pop(message_id, None)
-		bubble = self._streaming_widgets.pop(message_id, None)
-		if bubble is not None:
-			bubble.patch(text=full_text)
+		message_index = self._streaming_widgets.pop(message_id, None)
+		if isinstance(message_index, int) and 0 <= message_index < len(self._messages):
+			self._messages[message_index]["text"] = full_text
+			self._sync_thread(session)
 		else:
-			self.add_assistant_message(full_text)
+			self.add_assistant_message(full_text, session)
 		self.typing_indicator.patch(visible=len(self._streaming_widgets) > 0)
 		self.set_status("Idle")

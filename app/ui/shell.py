@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import threading
 import time
 from itertools import count
@@ -12,10 +13,12 @@ from typing import Any
 import butterflyui as ui
 
 from app.config import AppPaths, RuntimeSettings, resolve_paths
+from app.utils import read_json_file
 from genesis.core.ws_server import GenesisRuntime
 from .chat_page import ChatPage
 from .sidebar_view import SidebarView
 from .terminal_container import TerminalContainer
+from .terminal_process import TerminalProcess
 
 
 logger = logging.getLogger("genesis.shell")
@@ -151,6 +154,8 @@ class GenesisStudioShell:
 		self._last_delta_refresh = 0.0
 		self._terminal_visible   = False
 		self._ui_loop: asyncio.AbstractEventLoop | None = None
+		self._terminal_process: TerminalProcess | None = None
+		self._preferred_shell = self._resolve_preferred_shell()
 
 		self.bridge = RuntimeBridge(
 			on_message=self._on_runtime_message,
@@ -279,15 +284,22 @@ class GenesisStudioShell:
 
 	def _toggle_terminal(self, event=None) -> None:
 		self._terminal_visible = not self._terminal_visible
-		new_height = 300 if self._terminal_visible else 0
+		new_height = 420 if self._terminal_visible else 0
 		self._terminal_slot.props["height"] = new_height
 		try:
 			self.page.session.update_props(self._terminal_slot.control_id, {"height": new_height})
 		except Exception:
 			pass
 		if self._terminal_visible:
+			self._ensure_terminal_process()
 			self.terminal.open(self.page.session)
-			self.terminal.send_output(self.page.session, "\r\nGenesis terminal opened\r\n")
+			workspace_name = self.paths.root.name
+			shell_name = self._preferred_shell or "auto"
+			self._emit_terminal_output(
+				f"\r\n[{workspace_name}>] shell={shell_name} cwd={self.paths.root}\r\n"
+			)
+		else:
+			self._stop_terminal_process()
 		self._request_ui_refresh()
 
 	# ── Terminal messages (from WebView JS) ─────────────────────────
@@ -309,6 +321,7 @@ class GenesisStudioShell:
 		if payload.get("type") == "control" and payload.get("action") == "close":
 			self._terminal_visible = False
 			self._terminal_slot.props["height"] = 0
+			self._stop_terminal_process()
 			try:
 				self.page.session.update_props(self._terminal_slot.control_id, {"height": 0})
 			except Exception:
@@ -316,24 +329,15 @@ class GenesisStudioShell:
 			self._request_ui_refresh()
 			return
 
-		# Forward as a runtime event
-		self.bridge.send(
-			"ui.event",
-			{"type": f"terminal.{payload.get('type', 'unknown')}", "payload": payload},
-			msg_id=None,
-		)
-
-		# Simple built-in command handling
 		if payload.get("type") == "input":
+			self._ensure_terminal_process()
 			command = str(payload.get("data", "")).strip()
 			if not command:
 				return
-			args = {"root": "."} if command == "ls" else {"root": command}
-			self.bridge.send(
-				"tool.call",
-				{"tool": "fs.list", "args": args},
-				msg_id=next(self._request_ids),
-			)
+			if self._terminal_process is None:
+				self._emit_terminal_output("\r\nUnable to start shell process.\r\n")
+				return
+			self._terminal_process.write_line(command)
 
 	# ── Send message ────────────────────────────────────────────────
 
@@ -342,22 +346,46 @@ class GenesisStudioShell:
 		text = ""
 		if event is not None:
 			if isinstance(event, dict):
-				text = str(event.get("value", event.get("data", ""))).strip()
+				# Check payload.value first (MessageComposer structure)
+				payload = event.get("payload", {})
+				if isinstance(payload, dict):
+					text = str(payload.get("value", "")).strip()
+				# Fallback to direct keys
+				if not text:
+					text = str(
+						event.get("value")
+						or event.get("text")
+						or event.get("data")
+						or event.get("message")
+						or ""
+					).strip()
 			else:
-				val = getattr(event, "value", None) or getattr(event, "data", None)
+				val = (
+					getattr(event, "value", None)
+					or getattr(event, "text", None)
+					or getattr(event, "data", None)
+				)
 				if val:
 					text = str(val).strip()
+		# If no text found, fallback to composer value (covers some edge cases)
 		if not text:
 			text = self.chat_page.get_composer_text()
 		if not text:
 			return
+		# Always show the user's message locally right away so the UI feels
+		# responsive even when the runtime session hasn't been established yet.
+		self.chat_page.add_user_message(text, self.page.session)
+
+		self.chat_page.clear_composer()
+		# If there's no active runtime session, show the message locally and
+		# avoid attempting to send to the runtime. This prevents drops and
+		# keeps the conversation visible immediately.
 		if not self.current_session_id:
 			self.chat_page.set_status("No active session")
 			self._request_ui_refresh()
 			return
 
-		self.chat_page.add_user_message(text)
-		self.chat_page.clear_composer()
+		# With an active session, proceed to send and show waiting state.
 		self.chat_page.set_status("Waiting for response…")
 		self._request_ui_refresh()
 
@@ -435,7 +463,7 @@ class GenesisStudioShell:
 		if method == "chat.begin":
 			message_id = params.get("message_id")
 			if message_id:
-				self.chat_page.begin_streaming(message_id)
+				self.chat_page.begin_streaming(message_id, self.page.session)
 				self._request_ui_refresh()
 			return
 
@@ -443,7 +471,7 @@ class GenesisStudioShell:
 			message_id = params.get("message_id")
 			if not message_id:
 				return
-			self.chat_page.add_delta(message_id, params.get("delta", ""))
+			self.chat_page.add_delta(message_id, params.get("delta", ""), self.page.session)
 			now = time.monotonic()
 			if now - self._last_delta_refresh >= 0.05:
 				self._last_delta_refresh = now
@@ -458,7 +486,7 @@ class GenesisStudioShell:
 				text = "".join(
 					part.get("text", "") for part in content if isinstance(part, dict)
 				)
-			self.chat_page.finalize_stream(msg.get("id", ""), text)
+			self.chat_page.finalize_stream(msg.get("id", ""), text, self.page.session)
 			self._request_ui_refresh()
 			return
 
@@ -474,7 +502,7 @@ class GenesisStudioShell:
 				rendered = "\r\n".join(lines) + "\r\n"
 			else:
 				rendered = json.dumps(params, ensure_ascii=False, indent=2) + "\r\n"
-			self.terminal.send_output(self.page.session, rendered)
+			self._emit_terminal_output(rendered)
 
 		if method == "log.append":
 			line = params.get("line")
@@ -495,7 +523,7 @@ class GenesisStudioShell:
 			self.current_session_id = result.get("session_id")
 			self.sidebar.set_active(self.current_session_id)
 			self.chat_page.set_title(result.get("title", "Genesis"))
-			self.chat_page.clear_messages()
+			self.chat_page.clear_messages(self.page.session)
 			self.bridge.send(
 				"session.open",
 				{"session_id": self.current_session_id},
@@ -505,7 +533,7 @@ class GenesisStudioShell:
 			return
 
 		if "messages" in result:
-			self.chat_page.clear_messages()
+			self.chat_page.clear_messages(self.page.session)
 			self.chat_page.set_title(result.get("title", "Genesis"))
 			for item in result.get("messages", []):
 				role = item.get("role", "assistant")
@@ -516,9 +544,9 @@ class GenesisStudioShell:
 						part.get("text", "") for part in content if isinstance(part, dict)
 					)
 				if role == "user":
-					self.chat_page.add_user_message(text)
+					self.chat_page.add_user_message(text, self.page.session)
 				elif role == "assistant":
-					self.chat_page.add_assistant_message(text)
+					self.chat_page.add_assistant_message(text, self.page.session)
 			self._request_ui_refresh()
 
 	# ── UI refresh helper ───────────────────────────────────────────
@@ -537,6 +565,62 @@ class GenesisStudioShell:
 				self.page.update()
 			except Exception:
 				pass
+
+	def _resolve_preferred_shell(self) -> str:
+		payload = read_json_file(self.paths.terminal_payload, default={})
+		if isinstance(payload, dict):
+			value = payload.get("preferred_shell") or payload.get("shell")
+			if isinstance(value, str) and value.strip():
+				return value.strip()
+		env_value = os.environ.get("GENESIS_SHELL")
+		if env_value and env_value.strip():
+			return env_value.strip()
+		return ""
+
+	def _ensure_terminal_process(self) -> None:
+		if self._terminal_process is not None and self._terminal_process.is_running():
+			return
+		process = TerminalProcess(
+			workspace_root=self.paths.root,
+			on_output=self._emit_terminal_output,
+			on_closed=self._on_terminal_process_closed,
+			preferred_shell=self._preferred_shell or None,
+		)
+		if process.start():
+			self._terminal_process = process
+		else:
+			self._terminal_process = None
+
+	def _stop_terminal_process(self) -> None:
+		process = self._terminal_process
+		self._terminal_process = None
+		if process is not None:
+			process.stop()
+
+	def _emit_terminal_output(self, text: str) -> None:
+		if not text:
+			return
+		if self._ui_loop is None:
+			self.terminal.send_output(self.page.session, text)
+			return
+
+		try:
+			loop = asyncio.get_running_loop()
+		except RuntimeError:
+			loop = None
+
+		if loop is self._ui_loop:
+			self.terminal.send_output(self.page.session, text)
+			return
+
+		try:
+			self._ui_loop.call_soon_threadsafe(self.terminal.send_output, self.page.session, text)
+		except Exception:
+			self.terminal.send_output(self.page.session, text)
+
+	def _on_terminal_process_closed(self, exit_code: int | None) -> None:
+		self._terminal_process = None
+		self._emit_terminal_output(f"\r\nShell process closed ({exit_code}).\r\n")
 
 	# ── Genesis source-context builder ──────────────────────────────
 

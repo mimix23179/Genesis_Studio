@@ -4,6 +4,7 @@
 	var term = null;
 	var fitAddon = null;
 	var ready = false;
+	var lineBuffer = "";
 
 	/* ── Host bridge ── */
 	function sendToHost(payload) {
@@ -48,10 +49,20 @@
 	window.__genesis_receive = function (payload) {
 		if (!payload || typeof payload !== "object") return;
 		if (payload.type === "output") { writeOutput(payload.data || ""); }
+		if (payload.type === "meta") {
+			if (payload.workspace) setText("workspace_badge", payload.workspace);
+			if (payload.shell) setText("shell_badge", payload.shell);
+		}
 		if (payload.type === "control" && payload.action === "close") {
 			sendToHost({ type: "control", action: "close" });
 		}
 	};
+
+	function setText(id, value) {
+		var el = document.getElementById(id);
+		if (!el) return;
+		el.textContent = String(value || "");
+	}
 
 	function writeOutput(text) {
 		if (term) term.write(String(text));
@@ -61,8 +72,7 @@
 	function bootstrap() {
 		if (ready) return;
 		var mount = document.getElementById("terminal");
-		var input = document.getElementById("command_input");
-		if (!mount || !input) { setTimeout(bootstrap, 60); return; }
+		if (!mount) { setTimeout(bootstrap, 60); return; }
 
 		if (!window.Terminal) {
 			mount.innerHTML = '<p style="color:#8892a4;padding:12px;font-size:12px;">xterm.js failed to load — check network.</p>';
@@ -122,22 +132,47 @@
 		/* Welcome */
 		var payload = window.__TERMINAL_PAYLOAD__;
 		if (payload) {
+			if (payload.workspace) setText("workspace_badge", payload.workspace);
+			if (payload.shell) setText("shell_badge", payload.shell);
 			if (payload.welcome) term.writeln("\x1b[1;36m" + payload.welcome + "\x1b[0m");
 			if (Array.isArray(payload.motd)) payload.motd.forEach(function (l) { term.writeln(String(l)); });
 		}
-		term.writeln("\x1b[2m" + "Type a command below or use the AI chat to interact with Genesis." + "\x1b[0m");
+		term.writeln("\x1b[2m" + "Interactive shell attached. Run commands directly in this terminal." + "\x1b[0m");
+		term.writeln("");
+		sendToHost({ type: "terminal.ready" });
 
-		/* Click to focus input */
-		mount.addEventListener("click", function () { input.focus(); });
+		/* Click to focus terminal */
+		mount.addEventListener("click", function () { if (term) term.focus(); });
 
-		/* Command input handling */
-		input.addEventListener("keydown", function (e) {
-			if (e.key !== "Enter") return;
-			var cmd = (input.value || "").trim();
-			input.value = "";
-			if (!cmd) return;
-			term.writeln("\x1b[1;35m❯\x1b[0m " + cmd);
-			sendToHost({ type: "input", data: cmd });
+		/* Keyboard -> shell input */
+		term.onData(function (data) {
+			if (data === "\r") {
+				var cmd = lineBuffer;
+				lineBuffer = "";
+				term.write("\r\n");
+				sendToHost({ type: "input", data: cmd });
+				return;
+			}
+
+			if (data === "\u007f") {
+				if (lineBuffer.length > 0) {
+					lineBuffer = lineBuffer.slice(0, -1);
+					term.write("\b \b");
+				}
+				return;
+			}
+
+			if (data && data.charCodeAt(0) === 3) {
+				lineBuffer = "";
+				term.write("^C\r\n");
+				sendToHost({ type: "input", data: "" });
+				return;
+			}
+
+			if (data >= " " && data !== "\u007f" && !data.startsWith("\u001b")) {
+				lineBuffer += data;
+				term.write(data);
+			}
 		});
 
 		/* Header buttons */
@@ -161,7 +196,7 @@
 
 		/* Expose for Python */
 		window.__genesis_terminal = { term: term, fitAddon: fitAddon, writeOutput: writeOutput };
-		input.focus();
+		term.focus();
 	}
 
 	ensureXterm(bootstrap);

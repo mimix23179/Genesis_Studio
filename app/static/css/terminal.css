@@ -68,6 +68,19 @@ html, body {
 	text-transform: uppercase;
 }
 
+.terminal-header .badge {
+	font-size: 10px;
+	color: var(--term-text);
+	border: 1px solid var(--term-border);
+	padding: 2px 8px;
+	border-radius: 999px;
+	background: rgba(255, 255, 255, 0.04);
+	max-width: 260px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
 .terminal-header .controls {
 	display: flex;
 	gap: 4px;
@@ -98,7 +111,7 @@ html, body {
 .terminal-container {
 	flex: 1;
 	min-height: 0;
-	padding: 4px 8px;
+	padding: 8px;
 	overflow: hidden;
 }
 
@@ -108,39 +121,6 @@ html, body {
 
 .terminal-container .xterm-viewport {
 	overflow-y: auto !important;
-}
-
-/* ── Command input bar ── */
-.command-input {
-	display: flex;
-	align-items: center;
-	gap: 8px;
-	border-top: 1px solid var(--term-border);
-	background: rgba(255, 255, 255, 0.02);
-	padding: 8px 12px;
-	flex-shrink: 0;
-}
-
-.prompt {
-	color: var(--term-accent);
-	font-weight: 700;
-	font-size: 14px;
-	font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
-}
-
-.input-field {
-	flex: 1;
-	background: transparent;
-	border: none;
-	outline: none;
-	color: var(--term-text);
-	font-size: 13px;
-	font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
-	caret-color: var(--term-accent);
-}
-
-.input-field::placeholder {
-	color: rgba(231, 235, 243, 0.25);
 }
 
 /* ── Scrollbar ── */
