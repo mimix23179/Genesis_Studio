@@ -204,6 +204,16 @@ class ChatPage:
 		self._streaming_widgets.clear()
 		self.typing_indicator.patch(visible=False)
 
+	def get_messages_snapshot(self) -> list[dict[str, Any]]:
+		return [dict(message) for message in self._messages]
+
+	def restore_messages_snapshot(self, messages: list[dict[str, Any]] | None, session=None) -> None:
+		self._messages = [dict(message) for message in (messages or [])]
+		self._streaming_text.clear()
+		self._streaming_widgets.clear()
+		self.typing_indicator.patch(visible=False)
+		self._sync_thread(session)
+
 	def add_user_message(self, text: str, session=None) -> None:
 		self._messages.append(
 			{

@@ -190,9 +190,9 @@ def _fallback_rule(_state: OpenMLState, features: FeatureVector) -> RuleResult |
         name="fallback",
         plan=ActionPlan(
             action_type="ask_user",
-            question="What outcome should I prioritize next: diagnostics, search, or code changes?",
-            confidence=0.4,
-            reasons=["No explicit rule matched the current request."],
+            question="Could you clarify your desired outcome in one sentence?",
+            confidence=0.2,
+            reasons=["No explicit rule matched strongly; prefer generation path when available."],
             evidence=_make_evidence(
                 rule="fallback",
                 details={"intent_category": str(features.values.get("intent_category", "other"))},

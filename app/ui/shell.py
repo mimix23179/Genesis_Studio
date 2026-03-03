@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 import time
+import websockets
 from itertools import count
 from pathlib import Path
 from typing import Any
@@ -29,15 +30,18 @@ logger = logging.getLogger("genesis.shell")
 class RuntimeBridge:
 	"""Hosts / attaches to a Genesis runtime instance over WebSocket."""
 
-	def __init__(self, on_message, settings: RuntimeSettings) -> None:
+	def __init__(self, on_message, on_message_loop, settings: RuntimeSettings) -> None:
 		self._on_message = on_message
+		self._on_message_loop = on_message_loop
 		self._settings   = settings
 		self._loop: asyncio.AbstractEventLoop | None = None
 		self._ws   = None
 		self._server = None
+		self._runtime: GenesisRuntime | None = None
 		self._runtime_port: int | None = None
 		self._thread: threading.Thread | None = None
 		self._connected = threading.Event()
+		self._pending_messages: list[dict] = []
 
 	def start(self) -> None:
 		self._thread = threading.Thread(target=self._run, daemon=True)
@@ -48,48 +52,52 @@ class RuntimeBridge:
 		asyncio.set_event_loop(self._loop)
 		try:
 			self._loop.run_until_complete(self._bootstrap())
-		except Exception as exc:
-			logger.exception("Runtime bridge crashed: %s", exc)
+		except Exception:
+			pass
 
 	async def _bootstrap(self) -> None:
-		import websockets
 
 		ports = [
 			self._settings.preferred_port + offset
 			for offset in range(self._settings.max_port_scan)
 		]
 
-		# Try connecting to an existing runtime first
 		for port in ports:
-			url = f"ws://{self._settings.host}:{port}"
+			endpoint = f"{self._settings.host}:{port}"
+
 			try:
-				self._ws = await websockets.connect(url)
+				self._ws = await websockets.connect(
+					f"ws://{self._settings.host}:{port}",
+					open_timeout=0.75,
+				)
 				self._runtime_port = port
 				self._connected.set()
 				await self._recv_loop()
 				return
 			except Exception:
-				continue
+				pass
 
-		# No runtime found — start one ourselves
-		for port in ports:
 			try:
-				runtime = GenesisRuntime(
+				self._runtime = GenesisRuntime(
 					db_path=self._settings.db_path,
 					host=self._settings.host,
 					port=port,
 				)
 				self._server = await websockets.serve(
-					runtime._ws_handler, self._settings.host, port,
+					self._runtime._ws_handler,
+					self._settings.host,
+					port,
 				)
 				self._ws = await websockets.connect(
-					f"ws://{self._settings.host}:{port}"
+					f"ws://{self._settings.host}:{port}",
+					open_timeout=1.5,
 				)
 				self._runtime_port = port
 				self._connected.set()
 				await self._recv_loop()
 				return
-			except OSError:
+			except Exception as start_exc:
+				self._runtime = None
 				continue
 
 		raise RuntimeError("Unable to connect or bind Genesis runtime on scanned ports")
@@ -100,9 +108,27 @@ class RuntimeBridge:
 		try:
 			async for raw in self._ws:
 				message = json.loads(raw)
-				self._on_message(message)
-		except Exception as exc:
-			logger.warning("Runtime receive loop closed: %s", exc)
+				try:
+					# Schedule the message handler on the UI loop to avoid race conditions
+					if self._on_message_loop is not None:
+						self._on_message_loop.call_soon_threadsafe(self._on_message, message)
+					else:
+						# Buffer messages until UI loop is ready
+						self._pending_messages.append(message)
+				except Exception: 
+					pass
+		except Exception:
+			pass
+
+	def flush_pending_messages(self) -> None:
+		"""Flush any buffered messages to the UI loop. Called after mount()."""
+		if self._on_message_loop is not None and self._pending_messages:
+			for message in self._pending_messages:
+				try:
+					self._on_message_loop.call_soon_threadsafe(self._on_message, message)
+				except Exception:
+					pass
+			self._pending_messages.clear()
 
 	def send(self, method: str, params: dict, msg_id: int | None = None) -> None:
 		if self._loop is None or self._ws is None:
@@ -151,6 +177,8 @@ class GenesisStudioShell:
 		self.current_session_id: str | None = None
 		self._sessions: list[dict[str, Any]] = []
 		self._request_ids   = count(100)
+		self._request_meta: dict[int, dict[str, Any]] = {}
+		self._session_view_cache: dict[str, dict[str, Any]] = {}
 		self._last_delta_refresh = 0.0
 		self._terminal_visible   = False
 		self._ui_loop: asyncio.AbstractEventLoop | None = None
@@ -159,6 +187,7 @@ class GenesisStudioShell:
 
 		self.bridge = RuntimeBridge(
 			on_message=self._on_runtime_message,
+			on_message_loop=self._ui_loop,
 			settings=self.settings,
 		)
 
@@ -169,6 +198,11 @@ class GenesisStudioShell:
 			self._ui_loop = asyncio.get_running_loop()
 		except RuntimeError:
 			self._ui_loop = None
+
+		# Update the bridge with the UI loop now that we have it
+		self.bridge._on_message_loop = self._ui_loop
+		# Flush any messages that arrived before mount()
+		self.bridge.flush_pending_messages()
 
 		self.page.title = "Genesis Studio"
 
@@ -276,9 +310,10 @@ class GenesisStudioShell:
 		self.chat_page.set_status(
 			f"Connected · port {runtime_port}" if runtime_port else "Connected"
 		)
-		self.bridge.send("workspace.set", {"root": str(Path.cwd())}, msg_id=next(self._request_ids))
-		self.bridge.send("session.list", {}, msg_id=next(self._request_ids))
-		self.bridge.send("session.create", {"title": "New Conversation"}, msg_id=next(self._request_ids))
+		# Only request session list - don't auto-create a session
+		# Let _handle_response decide if we need a new session
+		self._send_runtime("session.list", {}, intent="session.list")
+		self._send_runtime("workspace.set", {"root": str(Path.cwd())}, intent="workspace.set")
 
 	# ── Terminal toggle ─────────────────────────────────────────────
 
@@ -390,59 +425,86 @@ class GenesisStudioShell:
 		self._request_ui_refresh()
 
 		outbound_text = text
+		system_prompt: str | None = None
 		if self.chat_page.use_genesis_context():
 			context_blob, stats = self._build_genesis_context()
 			self.chat_page.set_context_info(
 				f"Context: {stats['files']} files · {stats['chars']} chars"
 			)
 			if context_blob:
-				outbound_text = (
+				system_prompt = (
 					"You are Genesis running locally. Use the following source context "
 					"for accuracy.\n\n"
 					"[Genesis Source Context Start]\n"
 					f"{context_blob}\n"
 					"[Genesis Source Context End]\n\n"
-					"User request:\n"
-					f"{text}"
 				)
 		else:
 			self.chat_page.set_context_info("Context: disabled")
 
-		self.bridge.send(
+		self._send_runtime(
 			"chat.send",
 			{
 				"session_id": self.current_session_id,
 				"message": {"role": "user", "content": [{"type": "text", "text": outbound_text}]},
+				"system_prompt": system_prompt,
 			},
-			msg_id=next(self._request_ids),
+			intent="chat.send",
 		)
+		self._cache_active_session_state()
 
 	# ── Sidebar callbacks ───────────────────────────────────────────
 
 	def _on_new_chat(self, event=None) -> None:
-		self.bridge.send(
-			"session.create", {"title": "New Conversation"},
-			msg_id=next(self._request_ids),
-		)
+		"""Create a new conversation - update UI immediately while waiting for runtime."""
+		
+		# Optimistically update UI to show we're creating a new session
+		self.chat_page.set_status("Creating new conversation...")
+		self._request_ui_refresh()
+		
+		# Send request to runtime
+		self._cache_active_session_state()
+		self._send_runtime("session.create", {"title": "New Conversation"}, intent="session.create")
 
 	def _on_refresh_sessions(self, event=None) -> None:
-		self.bridge.send("session.list", {}, msg_id=next(self._request_ids))
+		"""Refresh the conversations list from the runtime."""
+		logger.info("[GenesisUI] Refreshing sessions...")
+		self.chat_page.set_status("Refreshing conversations...")
+		self._request_ui_refresh()
+		self._send_runtime("session.list", {}, intent="session.list")
 
 	def _open_session(self, session_id: str) -> None:
+		"""Switch to a different conversation."""
+		logger.info(f"[GenesisUI] Opening session: {session_id}")
+		if self.current_session_id == session_id:
+			return
+
+		self._cache_active_session_state()
 		self.current_session_id = session_id
 		self.sidebar.set_active(session_id)
-		self.bridge.send(
-			"session.open", {"session_id": session_id},
-			msg_id=next(self._request_ids),
-		)
+		cached = self._session_view_cache.get(session_id)
+		if cached:
+			self.chat_page.set_title(str(cached.get("title", "Genesis")))
+			self.chat_page.restore_messages_snapshot(cached.get("messages", []), self.page.session)
+			self.chat_page.set_status("Loaded conversation")
+		else:
+			self.chat_page.clear_messages(self.page.session)
+		self.chat_page.set_status("Loading conversation...")
 		self._request_ui_refresh()
+
+		self._send_runtime(
+			"session.open",
+			{"session_id": session_id},
+			intent="session.open",
+			meta={"session_id": session_id},
+		)
 
 	# ── Runtime message dispatcher ──────────────────────────────────
 
 	def _on_runtime_message(self, message: dict) -> None:
 		# JSON-RPC response (success)
 		if "id" in message and "result" in message:
-			self._handle_response(message["result"])
+			self._handle_response(message.get("id"), message["result"])
 			return
 
 		# JSON-RPC response (error)
@@ -457,7 +519,7 @@ class GenesisStudioShell:
 		params = message.get("params", {})
 
 		if method == "session.updated":
-			self.bridge.send("session.list", {}, msg_id=next(self._request_ids))
+			self._send_runtime("session.list", {}, intent="session.list")
 			return
 
 		if method == "chat.begin":
@@ -475,6 +537,7 @@ class GenesisStudioShell:
 			now = time.monotonic()
 			if now - self._last_delta_refresh >= 0.05:
 				self._last_delta_refresh = now
+				self._cache_active_session_state()
 				self._request_ui_refresh()
 			return
 
@@ -487,6 +550,7 @@ class GenesisStudioShell:
 					part.get("text", "") for part in content if isinstance(part, dict)
 				)
 			self.chat_page.finalize_stream(msg.get("id", ""), text, self.page.session)
+			self._cache_active_session_state()
 			self._request_ui_refresh()
 			return
 
@@ -510,31 +574,78 @@ class GenesisStudioShell:
 				self.chat_page.set_status(line)
 				self._request_ui_refresh()
 
-	def _handle_response(self, result: dict) -> None:
+	def _handle_response(self, request_id: int | None, result: dict) -> None:
+		request_meta = self._request_meta.pop(request_id, {}) if isinstance(request_id, int) else {}
+		request_intent = str(request_meta.get("intent", ""))
+		requested_session_id = str(request_meta.get("session_id", "")).strip()
+
 		if "sessions" in result:
+			logger.info(f"[GenesisUI] Received sessions list: {result.get('sessions', [])}")
 			self._sessions = result.get("sessions", [])
 			if not self.current_session_id and self._sessions:
 				self.current_session_id = self._sessions[0].get("id")
 			self.sidebar.set_sessions(self._sessions, self.current_session_id)
 			self._request_ui_refresh()
+			# If no sessions exist, create one automatically
+			if not self._sessions:
+				logger.info("[GenesisUI] No sessions found, creating initial session...")
+				self._on_new_chat()
+			elif self.current_session_id and request_intent == "session.list":
+				self._send_runtime(
+					"session.open",
+					{"session_id": self.current_session_id},
+					intent="session.open",
+					meta={"session_id": self.current_session_id},
+				)
 			return
 
 		if "session_id" in result and "title" in result and "messages" not in result:
-			self.current_session_id = result.get("session_id")
-			self.sidebar.set_active(self.current_session_id)
-			self.chat_page.set_title(result.get("title", "Genesis"))
+			# This is a session.create response - update local state immediately
+			session_id = result.get("session_id")
+			title = result.get("title", "New Conversation")
+			logger.info(f"[GenesisUI] Session created: {session_id}")
+			
+			# Add to local sessions list optimistically
+			new_session = {"id": session_id, "title": title}
+			if not any(s.get("id") == session_id for s in self._sessions):
+				self._sessions.insert(0, new_session)
+			
+			self.current_session_id = session_id
+			self.sidebar.set_sessions(self._sessions, session_id)
+			self.chat_page.set_title(title)
 			self.chat_page.clear_messages(self.page.session)
-			self.bridge.send(
+			self._session_view_cache[session_id] = {
+				"title": title,
+				"messages": [],
+			}
+			
+			# Now open the session to get its messages (if any)
+			self._send_runtime(
 				"session.open",
-				{"session_id": self.current_session_id},
-				msg_id=next(self._request_ids),
+				{"session_id": session_id},
+				intent="session.open",
+				meta={"session_id": session_id},
 			)
 			self._request_ui_refresh()
 			return
 
 		if "messages" in result:
+			if requested_session_id and self.current_session_id and requested_session_id != self.current_session_id:
+				logger.info(
+					"[GenesisUI] Ignoring stale session.open response for %s (active=%s)",
+					requested_session_id,
+					self.current_session_id,
+				)
+				return
+
+			opened_session_id = str(result.get("session_id", self.current_session_id or "")).strip()
+			if opened_session_id and self.current_session_id and opened_session_id != self.current_session_id:
+				return
+
+			# This is a session.open response
 			self.chat_page.clear_messages(self.page.session)
-			self.chat_page.set_title(result.get("title", "Genesis"))
+			title = result.get("title", "Genesis")
+			self.chat_page.set_title(title)
 			for item in result.get("messages", []):
 				role = item.get("role", "assistant")
 				content = item.get("content", [])
@@ -544,10 +655,43 @@ class GenesisStudioShell:
 						part.get("text", "") for part in content if isinstance(part, dict)
 					)
 				if role == "user":
-					self.chat_page.add_user_message(text, self.page.session)
+					self.chat_page.add_user_message(self._sanitize_user_display_text(text), self.page.session)
 				elif role == "assistant":
 					self.chat_page.add_assistant_message(text, self.page.session)
+			if opened_session_id:
+				self._session_view_cache[opened_session_id] = {
+					"title": title,
+					"messages": self.chat_page.get_messages_snapshot(),
+				}
+			self.chat_page.set_status("Idle")
 			self._request_ui_refresh()
+
+	def _send_runtime(self, method: str, params: dict, *, intent: str, meta: dict[str, Any] | None = None) -> None:
+		request_id = next(self._request_ids)
+		request_meta = {"intent": intent}
+		if isinstance(meta, dict):
+			request_meta.update(meta)
+		self._request_meta[request_id] = request_meta
+		self.bridge.send(method, params, msg_id=request_id)
+
+	def _cache_active_session_state(self) -> None:
+		if not self.current_session_id:
+			return
+		title = getattr(self.chat_page.title, "props", {}).get("text", "Genesis")
+		self._session_view_cache[self.current_session_id] = {
+			"title": str(title),
+			"messages": self.chat_page.get_messages_snapshot(),
+		}
+
+	def _sanitize_user_display_text(self, text: str) -> str:
+		if not text:
+			return ""
+		if "[Genesis Source Context Start]" not in text:
+			return text
+		marker = "User request:\n"
+		if marker in text:
+			return text.split(marker, 1)[1].strip()
+		return text
 
 	# ── UI refresh helper ───────────────────────────────────────────
 

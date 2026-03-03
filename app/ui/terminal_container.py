@@ -77,12 +77,19 @@ class TerminalContainer:
 			async def _invoke_async() -> None:
 				if self.view is None:
 					return
-				await self.view.invoke_async(
-					session,
-					"run_javascript",
-					{"value": script},
-					timeout=2.0,
-				)
+				try:
+					await self.view.invoke_async(
+						session,
+						"run_javascript",
+						{"value": script},
+						timeout=2.0,
+					)
+				except asyncio.TimeoutError:
+					print(f"[TerminalContainer] JS invoke timed out after 2.0 seconds (script={script[:40]}...)")
+				except asyncio.CancelledError:
+					print(f"[TerminalContainer] JS invoke was cancelled (script={script[:40]}...)")
+				except Exception as exc:
+					print(f"[TerminalContainer] JS invoke failed: {exc}")
 
 			loop.create_task(_invoke_async())
 		except Exception:

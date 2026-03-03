@@ -3,6 +3,13 @@ models/
 tests/
 data/
 docs/
+assets/
+config/
+datasets/
+knowledge_chat/
+openml/
+rules/
+scripts/
 .pytest_cache/
 __pycache__/
 .vscode/

@@ -1,6 +1,5 @@
 ﻿requests
-bitnet
-sentencepiece
+tokenizers
 transformers
 pytest
 flake8
@@ -14,3 +13,6 @@ pandas
 lightgbm
 xgboost
 torch
+tqdm
+regex
+orjson

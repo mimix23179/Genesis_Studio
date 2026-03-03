@@ -85,3 +85,26 @@ CREATE TABLE IF NOT EXISTS outcomes (
     data_json TEXT,
     FOREIGN KEY (trace_id) REFERENCES traces(id)
 );
+
+-- Phase 2C: doc_chunks — stable context units for retrieval
+CREATE TABLE IF NOT EXISTS doc_chunks (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    document_id TEXT,
+    path TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL,
+    total_chunks INTEGER NOT NULL,
+    offset_start INTEGER NOT NULL,
+    offset_end INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    blob_ref TEXT NOT NULL,
+    tags_json TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_doc_chunks_workspace
+    ON doc_chunks(workspace_id, path, chunk_index);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_doc_chunks_workspace_path_idx
+    ON doc_chunks(workspace_id, path, chunk_index);

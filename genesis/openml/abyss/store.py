@@ -703,6 +703,107 @@ class AbyssStore:
 
     # ── Query APIs ────────────────────────────────────────────────
 
+    # ── Doc Chunks (Phase 2C) ─────────────────────────────────────
+
+    def store_chunks(
+        self,
+        workspace_id: str,
+        chunks: list[dict[str, Any]],
+    ) -> int:
+        """Persist document chunks to the ``doc_chunks`` table + blob store.
+
+        Each chunk dict must contain:
+          chunk_id, path, chunk_index, total_chunks,
+          offset_start, offset_end, sha256, text, tags (optional)
+
+        Returns the number of chunks upserted.
+        """
+        if not self._workspace_exists(workspace_id):
+            raise ValueError(f"Unknown workspace_id: {workspace_id}")
+
+        now = _now()
+        written = 0
+
+        for c in chunks:
+            blob_ref = self._write_blob(c["text"].encode("utf-8"))
+            tags_json = json.dumps(c.get("tags", []), ensure_ascii=False)
+
+            with self._transaction():
+                self.conn.execute(
+                    """
+                    INSERT OR REPLACE INTO doc_chunks(
+                        id, workspace_id, document_id, path, chunk_index,
+                        total_chunks, offset_start, offset_end,
+                        sha256, blob_ref, tags_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        c["chunk_id"],
+                        workspace_id,
+                        c.get("document_id"),
+                        c["path"],
+                        c["chunk_index"],
+                        c["total_chunks"],
+                        c["offset_start"],
+                        c["offset_end"],
+                        c["sha256"],
+                        blob_ref,
+                        tags_json,
+                        now,
+                    ),
+                )
+            written += 1
+
+        return written
+
+    def load_chunks(self, workspace_id: str) -> list[dict[str, Any]]:
+        """Load all chunks for a workspace, including blob text."""
+        rows = self.conn.execute(
+            """
+            SELECT id, path, chunk_index, total_chunks,
+                   offset_start, offset_end, sha256, blob_ref, tags_json
+            FROM doc_chunks
+            WHERE workspace_id = ?
+            ORDER BY path, chunk_index
+            """,
+            (workspace_id,),
+        ).fetchall()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            blob_ref = str(row["blob_ref"])
+            text = self.load_blob(blob_ref).decode("utf-8")
+            tags = json.loads(row["tags_json"]) if row["tags_json"] else []
+            result.append({
+                "chunk_id": str(row["id"]),
+                "path": str(row["path"]),
+                "chunk_index": int(row["chunk_index"]),
+                "total_chunks": int(row["total_chunks"]),
+                "offset_start": int(row["offset_start"]),
+                "offset_end": int(row["offset_end"]),
+                "sha256": str(row["sha256"]),
+                "text": text,
+                "tags": tags,
+            })
+        return result
+
+    def count_chunks(self, workspace_id: str) -> int:
+        """Return the number of stored chunks for a workspace."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM doc_chunks WHERE workspace_id = ?",
+            (workspace_id,),
+        ).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def delete_chunks(self, workspace_id: str) -> int:
+        """Remove all chunks for a workspace. Returns count deleted."""
+        with self._transaction():
+            cursor = self.conn.execute(
+                "DELETE FROM doc_chunks WHERE workspace_id = ?",
+                (workspace_id,),
+            )
+        return cursor.rowcount
+
     def list_recent_traces(self, workspace_id: str, limit: int = 20) -> list[TraceSummary]:
         rows = self.conn.execute(
             """

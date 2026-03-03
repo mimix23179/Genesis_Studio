@@ -25,6 +25,7 @@ def _intent_category(user_message: str) -> str:
     search_terms = ("find", "search", "where is", "locate")
     edit_terms = ("edit", "change", "refactor", "fix", "update", "modify", "patch")
     run_terms = ("run", "test", "build", "execute")
+    chat_terms = ("hello", "hi", "hey", "how are you", "what", "why", "explain", "help")
 
     if any(term in text for term in debug_terms):
         return "debug"
@@ -34,6 +35,8 @@ def _intent_category(user_message: str) -> str:
         return "edit"
     if any(term in text for term in run_terms):
         return "run"
+    if any(term in text for term in chat_terms) or "?" in text:
+        return "chat"
     return "other"
 
 
