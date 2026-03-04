@@ -2,7 +2,8 @@ env/
 models/
 tests/
 data/
-docs/
+docs/*
+!docs/*.md
 assets/
 config/
 datasets/

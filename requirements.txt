@@ -16,3 +16,8 @@ torch
 tqdm
 regex
 orjson
+pywinpty
+pyte
+wcwidth
+psutil
+watchdog
