@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any, Callable
 
@@ -17,6 +18,11 @@ SUPPORTED_RPC_METHODS = [
     "session.create",
     "session.open",
     "chat.send",
+    "runtime.models.list",
+    "runtime.base_url.set",
+    "runtime.model.set",
+    "runtime.model.load",
+    "runtime.model.unload",
     "tool.list",
     "tool.call",
     "tool.execute",
@@ -70,6 +76,7 @@ class RuntimeService:
             "api_version": RUNTIME_API_VERSION,
             "model": self._provider.model,
             "ollama_base_url": self._provider.ollama_base_url,
+            "ollama_models_dir": os.environ.get("GENESIS_OLLAMA_MODELS_DIR", os.environ.get("OLLAMA_MODELS", "")),
             "workspace_root": self._workspace_getter(),
             "uptime_sec": round(uptime, 3),
             "session_count": self._sessions.session_count(),

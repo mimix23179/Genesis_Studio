@@ -32,6 +32,7 @@ class TerminalSession:
         self.preferred_shell = preferred_shell
         self.columns = max(40, int(columns))
         self.rows = max(10, int(rows))
+        self._ollama_models_dir = self._resolve_ollama_models_dir()
 
         self._backend = "none"
         self._active_shell = "auto"
@@ -171,10 +172,12 @@ class TerminalSession:
             return False
 
     def _start_subprocess(self, command: Sequence[str]) -> bool:
+        self._ollama_models_dir.mkdir(parents=True, exist_ok=True)
         try:
             self._process = subprocess.Popen(
                 [str(part) for part in command],
                 cwd=str(self.workspace_root),
+                env=self._build_subprocess_env(),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -236,11 +239,31 @@ class TerminalSession:
         return "".join(parts)
 
     def _apply_shell_bootstrap(self) -> None:
-        if self._active_shell == "cmd":
-            self.write("chcp 65001>nul\r\n")
+        # Ensure winpty-backed shells inherit the workspace-local Ollama store.
+        if self._backend != "winpty":
             return
-        if self._active_shell in {"pwsh", "powershell"}:
-            self.write("$utf8 = New-Object System.Text.UTF8Encoding; [Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8\r\n")
+        models_dir = str(self._ollama_models_dir)
+        escaped = models_dir.replace('"', '""')
+        commands: list[str] = []
+        if self._active_shell in {"powershell", "pwsh"}:
+            commands.append(
+                "$utf8 = New-Object System.Text.UTF8Encoding; "
+                "[Console]::OutputEncoding = $utf8; $OutputEncoding = $utf8"
+            )
+            commands.append(f'$env:OLLAMA_MODELS="{escaped}"')
+        elif self._active_shell == "cmd":
+            commands.append("chcp 65001>nul")
+            commands.append(f"set OLLAMA_MODELS={models_dir}")
+        elif self._active_shell in {"bash", "zsh", "sh"}:
+            commands.append(f"export OLLAMA_MODELS='{models_dir}'")
+        if not commands:
+            return
+        try:
+            line_ending = "\r\n" if self._active_shell in {"powershell", "pwsh", "cmd"} else "\n"
+            for command in commands:
+                self.write(command + line_ending)
+        except Exception:
+            pass
 
     @staticmethod
     def _decode_text(value: bytes | str | None) -> str:
@@ -298,3 +321,17 @@ class TerminalSession:
             if resolved is not None:
                 return resolved, resolved_name
         return None, "none"
+
+    def _resolve_ollama_models_dir(self) -> Path:
+        override = str(os.environ.get("GENESIS_OLLAMA_MODELS_DIR", "")).strip()
+        if override:
+            candidate = Path(override)
+            if candidate.is_absolute():
+                return candidate.resolve()
+            return (self.workspace_root / candidate).resolve()
+        return (self.workspace_root / "models/ollama").resolve()
+
+    def _build_subprocess_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env["OLLAMA_MODELS"] = str(self._ollama_models_dir)
+        return env

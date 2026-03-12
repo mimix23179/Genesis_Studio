@@ -11,15 +11,26 @@ class TerminalContainer:
     """Native ButterflyUI terminal panel with keyboard capture."""
 
     _SURFACE = "#0B0F14"
-    _SURFACE_ALT = "#111827"
-    _BORDER = "#1F2937"
-    _TEXT = "#E5E7EB"
+    _SURFACE_ALT = "#111A2E"
+    _BORDER = "#243045"
+    _TEXT = "#FFFFFF"
     _MUTED = "#9CA3AF"
     _ACCENT = "#10A37F"
+    _ON_ACCENT = "#FFFFFF"
+    _PLACEHOLDER = "#C8D2E5"
+    _CURSOR = "#FFFFFF"
+    _SELECTION = "#1D4ED8"
+    _GRADIENT_START = "#101828"
+    _GRADIENT_END = "#0F172A"
     _MAX_BUFFER = 240000
 
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
+        self._glass_mode = False
+        self._root_container: ui.Container | None = None
+        self._header_surface: ui.Surface | None = None
+        self._output_surface: ui.Surface | None = None
+        self._composer_surface: ui.Surface | None = None
         self._session = None
         self._pending_input = ""
         self._stream_output = ""
@@ -34,6 +45,7 @@ class TerminalContainer:
         self.status = ui.Text("Ready", font_size=11, color=self._MUTED)
         self.shell_select = ui.Select(
             label="Shell",
+            class_name="gs-terminal-input",
             value="auto",
             options=[
                 {"label": "Auto", "value": "auto"},
@@ -49,23 +61,17 @@ class TerminalContainer:
         )
         self.clear_button = ui.Button(
             text="Clear",
+            class_name="gs-terminal-button",
             variant="outlined",
             events=["click"],
             radius=8,
-            border_width=1,
-            border_color=self._BORDER,
-            text_color=self._TEXT,
-            bgcolor=self._SURFACE_ALT,
         )
         self.restart_button = ui.Button(
             text="Restart",
+            class_name="gs-terminal-button",
             variant="outlined",
             events=["click"],
             radius=8,
-            border_width=1,
-            border_color=self._BORDER,
-            text_color=self._TEXT,
-            bgcolor=self._SURFACE_ALT,
         )
         self.output_text = ui.Text(
             "",
@@ -87,24 +93,26 @@ class TerminalContainer:
         )
         self.command_input = ui.TextField(
             placeholder="Enter command and press Enter",
+            class_name="gs-terminal-input",
             events=["change", "submit"],
             expand=True,
             font_family="monospace",
+            radius=8,
+            style={
+                "fontFamily": "Consolas, Cascadia Code, Courier New, monospace",
+            },
         )
         self.send_button = ui.Button(
             text="Run",
+            class_name="gs-terminal-primary",
             variant="filled",
             events=["click"],
-            bgcolor=self._ACCENT,
-            text_color="#FFFFFF",
-            border_color=self._ACCENT,
-            border_width=1,
             radius=8,
             font_weight="700",
         )
 
     def build(self):
-        header = ui.Surface(
+        self._header_surface = ui.Surface(
             ui.Row(
                 ui.Column(self.title, self.status, spacing=2),
                 ui.Spacer(),
@@ -115,33 +123,28 @@ class TerminalContainer:
                 cross_axis="end",
             ),
             padding={"left": 10, "right": 10, "top": 8, "bottom": 8},
-            bgcolor=self._SURFACE_ALT,
-            border_color=self._BORDER,
-            border_width=1,
+            class_name="gs-terminal-header",
             radius=10,
         )
-        output = ui.Surface(
+        self._output_surface = ui.Surface(
             self.output_keys,
             expand=True,
-            bgcolor=self._SURFACE,
-            border_color=self._BORDER,
-            border_width=1,
+            class_name="gs-terminal-body",
             radius=10,
         )
-        composer = ui.Surface(
+        self._composer_surface = ui.Surface(
             ui.Row(self.command_input, self.send_button, spacing=8, cross_axis="end"),
             padding={"left": 10, "right": 10, "top": 8, "bottom": 8},
-            bgcolor=self._SURFACE_ALT,
-            border_color=self._BORDER,
-            border_width=1,
+            class_name="gs-terminal-composer",
             radius=10,
         )
-        return ui.Container(
-            ui.Column(header, output, composer, spacing=8, expand=True),
+        self._root_container = ui.Container(
+            ui.Column(self._header_surface, self._output_surface, self._composer_surface, spacing=8, expand=True),
             padding={"left": 10, "right": 10, "top": 8, "bottom": 8},
-            bgcolor=self._SURFACE,
+            class_name="gs-page-root",
             expand=True,
         )
+        return self._root_container
 
     def bind_events(
         self,
@@ -175,10 +178,7 @@ class TerminalContainer:
         _ = callback
 
     def open(self, session) -> None:
-        try:
-            self.output_keys.request_focus(session)
-        except Exception:
-            pass
+        _ = session
 
     def close(self, session) -> None:
         _ = session
@@ -201,6 +201,8 @@ class TerminalContainer:
     def render_screen(self, session, text: str) -> None:
         _ = session
         self._screen_text = str(text or "")
+        if self._screen_text:
+            self._stream_output = ""
         self._refresh_output()
 
     def send_output(self, session, text: str) -> None:
@@ -215,19 +217,12 @@ class TerminalContainer:
 
     def _refresh_output(self) -> None:
         combined = self._compose_output()
-        self.output_text.patch(text=combined)
-        session = self._session
-        if session is not None:
-            try:
-                self.output_view.scroll_to_end(session, animate=False)
-            except Exception:
-                pass
+        self.output_text.patch(text=combined, color=self._TEXT)
 
     def _compose_output(self) -> str:
-        if self._stream_output and self._screen_text:
-            separator = "" if self._stream_output.endswith(("\n", "\r")) else "\n"
-            return f"{self._stream_output}{separator}{self._screen_text}"
-        return self._screen_text or self._stream_output
+        if self._screen_text:
+            return self._screen_text
+        return self._stream_output
 
     def _on_command_change(self, value=None, event=None) -> None:
         _ = event
@@ -279,7 +274,7 @@ class TerminalContainer:
         if not text:
             return
         self._pending_input = ""
-        self.command_input.patch(value="")
+        self.command_input.patch(value="", text="", data="")
         if callable(self._on_command):
             self._on_command(text)
 
@@ -315,3 +310,6 @@ class TerminalContainer:
             return str(props.get("value", fallback))
         except Exception:
             return str(fallback)
+
+    def set_glass_mode(self, enabled: bool) -> None:
+        self._glass_mode = bool(enabled)

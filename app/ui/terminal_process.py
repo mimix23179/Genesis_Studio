@@ -10,7 +10,7 @@ from genesis.backend.terminal import TerminalEmulator, TerminalSession
 class TerminalProcess:
     """Terminal orchestration: PTY session + ANSI emulator + key mapping."""
 
-    _DEFAULT_COLS = 120
+    _DEFAULT_COLS = 180
     _DEFAULT_ROWS = 28
 
     def __init__(

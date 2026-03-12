@@ -27,6 +27,8 @@ class RuntimeSettings:
 	ollama_base_url: str = "http://127.0.0.1:11434"
 	model: str = "qwen2.5-coder:7b"
 	request_timeout: float = 120.0
+	ollama_models_dir: str = "models/ollama"
+	ollama_auto_pull: bool = True
 	preferred_shell: str = "auto"
 
 
@@ -80,6 +82,17 @@ def load_runtime_settings(settings_file: Path) -> RuntimeSettings:
 		value = runtime.get(name, fallback)
 		return str(value).strip() or fallback
 
+	def _bool(name: str, fallback: bool) -> bool:
+		value = runtime.get(name, fallback)
+		if isinstance(value, bool):
+			return value
+		raw = str(value).strip().lower()
+		if raw in {"1", "true", "yes", "on"}:
+			return True
+		if raw in {"0", "false", "no", "off"}:
+			return False
+		return bool(fallback)
+
 	host = os.environ.get("GENESIS_RUNTIME_HOST", _str("host", "127.0.0.1"))
 	preferred_port = _int("preferred_port", 9988)
 	max_port_scan = _int("max_port_scan", 12)
@@ -87,6 +100,11 @@ def load_runtime_settings(settings_file: Path) -> RuntimeSettings:
 	ollama_base_url = os.environ.get("GENESIS_OLLAMA_BASE_URL", _str("ollama_base_url", "http://127.0.0.1:11434"))
 	model = os.environ.get("GENESIS_MODEL", _str("model", "qwen2.5-coder:7b"))
 	request_timeout = _float("request_timeout", 120.0)
+	ollama_models_dir = os.environ.get("GENESIS_OLLAMA_MODELS_DIR", _str("ollama_models_dir", "models/ollama"))
+	ollama_auto_pull = _bool("ollama_auto_pull", True)
+	env_auto_pull = os.environ.get("GENESIS_OLLAMA_AUTO_PULL")
+	if env_auto_pull is not None:
+		ollama_auto_pull = str(env_auto_pull).strip().lower() in {"1", "true", "yes", "on"}
 	preferred_shell = _str("preferred_shell", "")
 	if not preferred_shell:
 		preferred_shell = os.environ.get("GENESIS_SHELL", "auto")
@@ -100,5 +118,7 @@ def load_runtime_settings(settings_file: Path) -> RuntimeSettings:
 		ollama_base_url=ollama_base_url.rstrip("/"),
 		model=model,
 		request_timeout=max(5.0, request_timeout),
+		ollama_models_dir=ollama_models_dir,
+		ollama_auto_pull=ollama_auto_pull,
 		preferred_shell=preferred_shell,
 	)

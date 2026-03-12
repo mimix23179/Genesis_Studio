@@ -1,7 +1,23 @@
 from __future__ import annotations
 
-import butterflyui as butterfly
 import socket
+import sys
+from pathlib import Path
+
+
+def _bootstrap_local_butterflyui() -> None:
+    root = Path(__file__).resolve().parents[2]
+    source = root / "ButterflyUI" / "butterflyui" / "sdk" / "python" / "packages" / "butterflyui" / "src"
+    if not source.exists():
+        return
+    source_str = str(source)
+    if source_str not in sys.path:
+        sys.path.insert(0, source_str)
+
+
+_bootstrap_local_butterflyui()
+
+import butterflyui as butterfly
 
 from app.config import resolve_paths
 from app.ui.shell import GenesisStudioShell

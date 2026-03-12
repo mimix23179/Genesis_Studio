@@ -37,7 +37,7 @@ class OllamaRuntime:
             ollama_base_url=ollama_base_url,
             request_timeout=request_timeout,
         )
-        self._sessions = SessionService()
+        self._sessions = SessionService(storage_path=Path.cwd() / "data" / "conversations.json")
         self._runtime = RuntimeService(
             provider=self._provider,
             session_service=self._sessions,
@@ -69,6 +69,26 @@ class OllamaRuntime:
         if method == "runtime.health":
             return await self._runtime.health()
 
+        if method == "runtime.models.list":
+            return self._provider.list_models_payload()
+
+        if method == "runtime.base_url.set":
+            return self._provider.set_base_url(str(params.get("ollama_base_url", "")).strip())
+
+        if method == "runtime.model.set":
+            return self._provider.set_active_model(str(params.get("model", "")).strip())
+
+        if method == "runtime.model.load":
+            return self._provider.load_model_payload(
+                model=str(params.get("model", "")).strip() or None,
+                keep_alive=str(params.get("keep_alive", "30m")).strip() or "30m",
+            )
+
+        if method == "runtime.model.unload":
+            return self._provider.unload_model_payload(
+                model=str(params.get("model", "")).strip() or None
+            )
+
         if method == "workspace.set":
             return self._runtime.set_workspace(str(params.get("root", "")))
 
@@ -77,10 +97,15 @@ class OllamaRuntime:
 
         if method == "session.create":
             title = str(params.get("title", "New Conversation"))
-            created = self._sessions.create_session(title)
+            active_model = str(params.get("active_model", "")).strip() or self._provider.model
+            created = self._sessions.create_session(title, active_model=active_model)
             await self._notify(
                 "session.updated",
-                {"session_id": created["session_id"], "action": "created"},
+                {
+                    "session_id": created["session_id"],
+                    "action": "created",
+                    "title": created["title"],
+                },
             )
             return created
 
